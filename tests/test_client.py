@@ -299,7 +299,7 @@ def test_sync_completion_uses_official_bridge_with_no_cursor_tools():
         options = sdk.options[0]
         assert options["api_key"] == "crsr_test"
         assert options["model"] == "composer-2.5"
-        assert options["tools"] == []
+        assert options["tools"] == ["mcp"]
         assert options["mcp_servers"] == {}
         assert "sandbox_options" not in options["local"]
         assert not Path(options["local"]["cwd"]).exists()

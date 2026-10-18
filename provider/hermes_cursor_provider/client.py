@@ -7,6 +7,7 @@ import base64
 import hashlib
 import importlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -20,19 +21,38 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, cast
 
+logger = logging.getLogger(__name__)
+
 CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
+_MAX_TURN_TOOL_CALLS = 16
 
 
 class CursorSDKRunError(RuntimeError):
     """A terminal Cursor SDK run failure with Hermes-readable status."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         lowered = message.lower()
-        self.status_code = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
-        self.error_code = "cursor_sdk_run_failed"
+        if status_code is not None:
+            self.status_code = status_code
+        else:
+            self.status_code = 429 if "out of usage" in lowered or "increase limits" in lowered else 502
+        self.error_code = error_code or "cursor_sdk_run_failed"
+        if body is not None:
+            # The classifier reads the code off the parsed body (agent/error_classifier.py),
+            # so the structured copy must travel with the exception, not only the attribute.
+            self.body = body
+        # Diagnostic only — nothing reads this. If it must be observable, put it in the message.
+        self.recorded_calls: list[Any] = []
 
 
 def _plain(value: Any) -> Any:
@@ -165,26 +185,45 @@ def render_prompt(
     *,
     tools: list[Any] | None = None,
     tool_choice: Any = None,
+    native_tools: bool = False,
 ) -> tuple[str, set[str]]:
     specs = tool_specs(tools, tool_choice)
     allowed = {spec["name"] for spec in specs}
     sections = [
         "You are the model inside Hermes Agent. Hermes is the only tool control plane.",
-        "Cursor built-in tools and MCP servers are disabled. Never claim to have read, written, "
-        "executed, browsed, or changed anything unless the transcript contains the corresponding Hermes tool result.",
     ]
-    if specs:
+    if native_tools and specs:
         sections.extend(
             [
-                "When a tool is needed, output only one or more blocks in this exact form: "
-                '<tool_call>{"id":"call_1","type":"function","function":{"name":"NAME",'
-                '"arguments":"{\\"key\\":\\"value\\"}"}}</tool_call>. '
-                "The function name must be listed below and arguments must be valid JSON. Stop after the tool request; Hermes executes it.",
+                "Cursor built-in tools and MCP servers are disabled. The Hermes tools listed "
+                "below are offered as native tool calls: Hermes executes each call and returns "
+                "the result. Never claim to have read, written, executed, browsed, or changed "
+                "anything unless the transcript contains the corresponding Hermes tool result.",
+                "When a tool is needed, call it directly with the native tool-call mechanism. "
+                "Do not describe the call in prose. Stop after the tool request; Hermes "
+                "executes it and continues the turn.",
                 "Hermes tools:\n" + json.dumps(specs, ensure_ascii=False, separators=(",", ":")),
             ]
         )
     else:
-        sections.append("No Hermes tools are available for this request. Answer in plain text.")
+        sections.extend(
+            [
+                "Cursor built-in tools and MCP servers are disabled. Never claim to have read, written, "
+                "executed, browsed, or changed anything unless the transcript contains the corresponding Hermes tool result.",
+            ]
+        )
+        if specs:
+            sections.extend(
+                [
+                    "When a tool is needed, output only one or more blocks in this exact form: "
+                    '<tool_call>{"id":"call_1","type":"function","function":{"name":"NAME",'
+                    '"arguments":"{\\"key\\":\\"value\\"}"}}</tool_call>. '
+                    "The function name must be listed below and arguments must be valid JSON. Stop after the tool request; Hermes executes it.",
+                    "Hermes tools:\n" + json.dumps(specs, ensure_ascii=False, separators=(",", ":")),
+                ]
+            )
+        else:
+            sections.append("No Hermes tools are available for this request. Answer in plain text.")
     if tool_choice == "required":
         sections.append("A Hermes tool call is required before answering.")
     sections.append(
@@ -309,6 +348,110 @@ def _tool_delta(call: Any, index: int) -> Any:
         type="function",
         function=SimpleNamespace(name=call.function.name, arguments=call.function.arguments),
     )
+
+
+def _new_tool_holder() -> dict[str, Any]:
+    """Per-turn state the custom-tool closures resolve at call time.
+
+    The agent (and therefore the SDK's registered handlers) outlives a turn, so the
+    closures must read the *live* dict instead of capturing a list or a name set.
+    """
+    return {"sink": [], "allowed": set(), "registered": set(), "active": False}
+
+
+def _normalise_call_id(raw: object) -> str:
+    """Cursor ids embed a newline ('call-…-1\\nfc_…_0'); keep the first segment.
+
+    Returns "" when Cursor omitted the id — the caller drops that entry (fail
+    closed); minting a random id here would guarantee a call that can never match.
+    """
+    return str(raw or "").split("\n", 1)[0].strip()
+
+
+def _call_object_from_entry(entry: dict[str, Any], ordinal: int) -> Any:
+    """Turn one reconciled sink entry into the pinned Hermes tool-call object."""
+    call_id = str(entry.get("tool_call_id") or "").strip() or f"cursor_call_{ordinal}"
+    arguments = entry.get("arguments") or {}
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+    return SimpleNamespace(
+        id=call_id,
+        call_id=call_id,
+        type="function",
+        function=SimpleNamespace(name=str(entry.get("name") or ""), arguments=arguments),
+    )
+
+
+def hermes_tools_as_custom_tools(specs: list[dict[str, Any]], holder: dict[str, Any]) -> dict[str, Any]:
+    """Register Hermes tools as Cursor custom tools whose callbacks only queue calls.
+
+    ``execute`` never runs a tool: it records ``{name, arguments, tool_call_id}`` on the
+    current turn's sink and acks. Hermes executes the tool (approvals, logging, the real
+    runner) once the call comes back on the completion.
+    """
+
+    def execute_factory(name: str) -> Any:
+        def execute(args: Any, context: Any) -> str:
+            if not holder["active"]:  # outside this turn's send()…run-end window
+                logger.info("cursor: callback outside the run window for %s", name)
+                return "refused: no active turn"
+            if name not in holder["allowed"]:  # the LIVE set, not a captured one
+                logger.info("cursor: callback for a tool this turn did not offer: %s", name)
+                return "refused: tool not offered this turn"
+            if len(holder["sink"]) >= _MAX_TURN_TOOL_CALLS:
+                logger.info("cursor: refusing tool call %s: turn cap reached", name)
+                return "refused: too many tool calls in one turn; state the final answer now"
+            cid = _normalise_call_id(getattr(context, "tool_call_id", None))
+            if not cid:  # Cursor omitted the id -> Hermes could never see it
+                logger.info("cursor: refusing tool call %s: Cursor sent no call id", name)
+                return "refused: the call was not delivered (no id); state the final answer"
+            holder["sink"].append(
+                {
+                    "name": name,
+                    "arguments": dict(args),
+                    "tool_call_id": cid,
+                }
+            )
+            return "queued"
+
+        return execute
+
+    return {
+        spec["name"]: {
+            "description": spec["description"],
+            "input_schema": spec["parameters"],
+            "execute": execute_factory(spec["name"]),
+        }
+        for spec in specs
+    }
+
+
+def _merged_calls(
+    holder: dict[str, Any] | None,
+    event_ids: set[str],
+    parser_calls: list[Any],
+) -> list[Any]:
+    """This turn's calls: reconciled native ones, else the honoured parser fallback.
+
+    Reconciliation against the run's own ``tool_call`` events is the only filter, so a
+    callback that lands late (or after a later turn rebound the holder) can never become
+    a fresh Hermes tool call.
+    """
+    if not holder:
+        return list(parser_calls)
+    seen = {_normalise_call_id(value) for value in event_ids}
+    native: list[Any] = []
+    for entry in list(holder.get("sink") or []):
+        cid = _normalise_call_id(entry.get("tool_call_id"))
+        if not cid or cid not in seen:
+            logger.info(
+                "cursor: dropping a tool callback outside this run (%r, id %r)",
+                entry.get("name"),
+                cid,
+            )
+            continue
+        native.append(_call_object_from_entry(entry, len(native) + 1))
+    return native or list(parser_calls)
 
 
 def _unsent_tail(delivered: str, full: str) -> str:
@@ -580,6 +723,7 @@ class _Session:
     agent: Any = None
     history: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
+    tool_holder: dict[str, Any] = field(default_factory=_new_tool_holder)
 
 
 _REGISTRY_LOCK = threading.RLock()
@@ -819,17 +963,31 @@ class CursorSDKClient:
         cwd: Path,
         model: str | None,
         timeout: float,
+        specs: list[dict[str, Any]],
+        holder: dict[str, Any] | None = None,
     ) -> Any:
         client = bridge.client().with_options(
             timeout=timeout,
             unary_timeout=min(timeout, 30.0),
             stream_timeout=timeout,
         )
+        local: dict[str, Any] = {"cwd": str(cwd)}
+        custom_tools = (
+            hermes_tools_as_custom_tools(specs, holder) if holder is not None and specs else {}
+        )
+        if custom_tools:
+            # "mcp" is the only capability group that still offers custom tools; an empty
+            # list offers nothing at all, custom tools included (probe-custom-tool.json).
+            local["custom_tools"] = custom_tools
+        if holder is not None:
+            # The SDK Agent exposes no options to read back, so this is the only record of
+            # the set the live agent was created with (the recreate rule compares it).
+            holder["registered"] = {spec["name"] for spec in specs}
         options: dict[str, Any] = {
             "api_key": self.api_key,
-            "local": {"cwd": str(cwd)},
+            "local": local,
             "mcp_servers": {},
-            "tools": [],
+            "tools": ["mcp"] if custom_tools else [],
         }
         selected_model = _model_selection(model)
         if selected_model:
@@ -844,6 +1002,7 @@ class CursorSDKClient:
         images: list[dict[str, str]],
         allowed_names: set[str],
         control: _StreamControl | None = None,
+        holder: dict[str, Any] | None = None,
     ) -> Any:
         """Run one turn; if it ends on a plan with tools available, nudge once for the call.
 
@@ -851,12 +1010,22 @@ class CursorSDKClient:
         expecting a native tool call that this prompt-protocol transport never sees. Without
         a nudge Hermes treats the announcement as the final answer and closes the task."""
         result, calls, content = yield from self._run_once(
-            agent, prompt=prompt, images=images, allowed_names=allowed_names, control=control
+            agent,
+            prompt=prompt,
+            images=images,
+            allowed_names=allowed_names,
+            control=control,
+            holder=holder,
         )
         if calls or not allowed_names or not _plan_nudge_enabled() or not _looks_like_plan(content):
             return result, calls, content
         result, calls, more = yield from self._run_once(
-            agent, prompt=PLAN_NUDGE, images=[], allowed_names=allowed_names, control=control
+            agent,
+            prompt=PLAN_NUDGE,
+            images=[],
+            allowed_names=allowed_names,
+            control=control,
+            holder=holder,
         )
         return result, calls, "\n\n".join(part for part in (content, more) if part)
 
@@ -868,12 +1037,16 @@ class CursorSDKClient:
         images: list[dict[str, str]],
         allowed_names: set[str],
         control: _StreamControl | None = None,
+        holder: dict[str, Any] | None = None,
     ) -> Any:
         """Run one agent turn, yielding ('text'|'call', value) events as they stream.
 
         Returns (result, calls, content) — the extraction the buffered path used,
-        produced incrementally so callers see text before the SDK run completes."""
+        produced incrementally so callers see text before the SDK run completes.
+        ``calls`` is the merged list: this run's reconciled native calls, or the
+        honoured parser calls when none were delivered."""
         parser = _ToolBlockStream(allowed_names)
+        event_ids: set[str] = set()
         run = None
         try:
             run = agent.send({"text": prompt, "images": images})
@@ -889,6 +1062,8 @@ class CursorSDKClient:
             if callable(stream):
                 for event in cast(Iterable[Any], stream()):
                     kind = str(getattr(event, "type", ""))
+                    if kind == "tool_call":
+                        event_ids.add(_normalise_call_id(getattr(event, "call_id", None)))
                     if kind == "assistant":
                         payload = getattr(event, "message", None)
                         for block in getattr(payload, "content", ()) or ():
@@ -917,7 +1092,7 @@ class CursorSDKClient:
             if tail:
                 yield from parser.feed(tail)
             yield from parser.flush()
-            return result, parser.calls, parser.text
+            return result, _merged_calls(holder, event_ids, parser.calls), parser.text
         except BaseException:
             if run is not None:
                 with suppress(Exception):
@@ -939,15 +1114,27 @@ class CursorSDKClient:
         model: str | None,
         timeout: float,
         allowed_names: set[str],
+        specs: list[dict[str, Any]],
         control: _StreamControl | None = None,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
         sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(prefix="ephemeral-", dir=str(sessions_root)) as cwd:
-            agent = self._create_agent(
-                bridge=bridge, cwd=Path(cwd), model=model, timeout=timeout
-            )
+            # A one-shot agent gets its own holder, which retires with the agent below.
+            holder = _new_tool_holder()
+            holder["sink"] = []
+            holder["active"] = True
+            holder["allowed"] = {spec["name"] for spec in specs}
+            agent = None
             try:
+                agent = self._create_agent(
+                    bridge=bridge,
+                    cwd=Path(cwd),
+                    model=model,
+                    timeout=timeout,
+                    specs=specs,
+                    holder=holder,
+                )
                 return (
                     yield from self._run_agent(
                         agent,
@@ -955,11 +1142,14 @@ class CursorSDKClient:
                         images=images,
                         allowed_names=allowed_names,
                         control=control,
+                        holder=holder,
                     )
                 )
             finally:
-                with suppress(Exception):
-                    agent.close()
+                holder["active"] = False
+                if agent is not None:
+                    with suppress(Exception):
+                        agent.close()
 
     def _execute(
         self,
@@ -978,13 +1168,14 @@ class CursorSDKClient:
         convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
         _split_model(model)  # reject malformed model parameters before launching the bridge
+        specs = tool_specs(tools, tool_choice)
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
 
         if not session_scope:
             prompt, allowed_names = render_prompt(
-                messages, tools=tools, tool_choice=tool_choice
+                messages, tools=tools, tool_choice=tool_choice, native_tools=bool(specs)
             )
             return (
                 yield from self._run_ephemeral(
@@ -994,6 +1185,7 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    specs=specs,
                     control=control,
                 )
             )
@@ -1004,7 +1196,7 @@ class CursorSDKClient:
         if session is None:
             # ponytail: concurrent turns bypass shared state instead of queueing or corrupting it.
             prompt, allowed_names = render_prompt(
-                messages, tools=tools, tool_choice=tool_choice
+                messages, tools=tools, tool_choice=tool_choice, native_tools=bool(specs)
             )
             return (
                 yield from self._run_ephemeral(
@@ -1014,22 +1206,34 @@ class CursorSDKClient:
                     model=model,
                     timeout=timeout,
                     allowed_names=allowed_names,
+                    specs=specs,
                     control=control,
                 )
             )
 
+        holder = session.tool_holder
         try:
+            # Per turn, in this order: a fresh sink, the run window, then the live name set.
+            holder["sink"] = []
+            holder["active"] = True
+            holder["allowed"] = {spec["name"] for spec in specs}
             extends = (
                 session.agent is not None
                 and len(incoming) == len(messages)
                 and len(incoming) > len(session.history)
                 and incoming[: len(session.history)] == session.history
             )
-            if session.agent is not None and not extends:
+            toolset_changed = (
+                session.agent is not None and holder["allowed"] != holder["registered"]
+            )
+            if session.agent is not None and (not extends or toolset_changed):
                 with suppress(Exception):
                     session.agent.close()
                 session.agent = None
                 session.history.clear()
+                # Re-send the whole transcript to the fresh agent; a delta alone would
+                # silently drop the session's context.
+                extends = False
 
             offset = len(session.history) if extends else 0
             request_messages = messages[offset:]
@@ -1039,9 +1243,11 @@ class CursorSDKClient:
                     cwd=session.cwd,
                     model=model,
                     timeout=timeout,
+                    specs=specs,
+                    holder=holder,
                 )
             prompt, allowed_names = render_prompt(
-                request_messages, tools=tools, tool_choice=tool_choice
+                request_messages, tools=tools, tool_choice=tool_choice, native_tools=bool(specs)
             )
             result, calls, content = yield from self._run_agent(
                 session.agent,
@@ -1049,10 +1255,14 @@ class CursorSDKClient:
                 images=extract_images(request_messages),
                 allowed_names=allowed_names,
                 control=control,
+                holder=holder,
             )
             session.history = incoming + [_assistant_history(content, calls)]
             return result, calls, content
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, CursorSDKRunError):
+                # Diagnostic only — nothing reads this; the message is the observable channel.
+                exc.recorded_calls = list(holder["sink"])
             if session.agent is not None:
                 with suppress(Exception):
                     session.agent.close()
@@ -1060,6 +1270,8 @@ class CursorSDKClient:
             session.history.clear()
             raise
         finally:
+            # Spans the main run and the nudge run; a callback after this is out of window.
+            holder["active"] = False
             _release_session(session)
 
     def _create_chat_completion(
@@ -1163,11 +1375,11 @@ class CursorSDKClient:
                 try:
                     kind, value = next(execution)
                 except StopIteration as stop:
-                    result, _, _ = stop.value
+                    result, calls, _ = stop.value
                     break
                 if kind == "call":
-                    calls.append(value)
-                    yield chunk(tool_calls=[_tool_delta(value, len(calls) - 1)])
+                    # Buffered: the merged list `_run_once` returns is the only source of
+                    # call deltas (a parser call it did not honour must not leak out).
                     continue
                 if not value:
                     continue
@@ -1187,6 +1399,8 @@ class CursorSDKClient:
             response_model = str(
                 model or getattr(getattr(result, "model", None), "id", "") or "cursor"
             )
+            for index, call in enumerate(calls):
+                yield chunk(tool_calls=[_tool_delta(call, index)])
             yield chunk(finish_reason="tool_calls" if calls else "stop")
             yield SimpleNamespace(
                 id=stream_id,
