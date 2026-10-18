@@ -12,7 +12,11 @@ from pathlib import Path
 
 import pytest
 
-import hermes_cli  # editable install; used only to locate the core tree root
+# Optional core dependency: skip cleanly under the plugin venv (so whole-directory
+# collection does not die there) and still run under the core venv.
+hermes_cli = pytest.importorskip(
+    "hermes_cli", reason="needs the Hermes core editable install"
+)
 
 # ``providers`` imports ``hermes_cli.update_channel``, which imports the repo-local ``pm``
 # package. The editable install does not expose ``pm``, so put the core root on sys.path
