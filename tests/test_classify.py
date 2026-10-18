@@ -12,10 +12,12 @@ from pathlib import Path
 
 import pytest
 
-# Optional core dependency: skip cleanly under the plugin venv (so whole-directory
-# collection does not die there) and still run under the core venv.
+# Optional core dependency: skip cleanly under the plugin venv, where the module is
+# genuinely absent, but stay loud under the core venv when an installed core is broken.
 hermes_cli = pytest.importorskip(
-    "hermes_cli", reason="needs the Hermes core editable install"
+    "hermes_cli",
+    exc_type=ModuleNotFoundError,
+    reason="needs the Hermes core editable install",
 )
 
 # ``providers`` imports ``hermes_cli.update_channel``, which imports the repo-local ``pm``
