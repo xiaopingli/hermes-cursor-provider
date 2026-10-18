@@ -1223,3 +1223,98 @@ def test_listing_skips_malformed_unknown_bare_and_duplicate_variants(monkeypatch
         "gpt-5.4",
         "composer-2.5@fast=true",
     ]
+
+
+# --- plan-only replies: nudge once for the <tool_call> before ending the turn ---
+
+_CALL = '<tool_call>{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"FIX.md\\"}"}}</tool_call>'
+
+
+def _sequenced(sdk, texts):
+    """Agent whose successive send() calls return the given reply texts in order."""
+    agent = FakeAgent(sdk)
+    replies = list(texts)
+
+    def send(message):
+        agent.messages.append(message)
+        text = replies.pop(0) if replies else ""
+        return FakeRun(FakeResult(result=text, model=sdk.result.model, usage=sdk.result.usage))
+
+    agent.send = send
+    sdk.create_agent = lambda options: agent
+    return agent
+
+
+def _create(client, tools=True, stream=False):
+    return client.chat.completions.create(
+        model="grok-4.7",
+        messages=[{"role": "user", "content": "apply the fix note"}],
+        tools=[_tool()] if tools else None,
+        stream=stream,
+    )
+
+
+def _sdk_client():
+    client = CursorSDKClient(api_key="crsr_test")
+    _create(client)  # launch the bridge once so the fake SDK instance exists
+    return client, FakeCursorClient.instances[-1]
+
+
+@pytest.mark.parametrize("plan", [
+    "I'll start by reading the fix note so the groups are applied exactly.",
+    "Let me read the fix instructions first.",
+    "I will read FIX.md and then apply group 1:",
+    "First, I'll read the review file.",
+])
+def test_plan_only_reply_is_nudged_once_into_a_tool_call(plan):
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, [plan, _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 2
+    assert "<tool_call>" in agent.messages[1]["text"]
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    assert choice.message.tool_calls[0].function.name == "read_file"
+
+
+def test_nudge_is_attempted_only_once():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll read the file.", "I'll read the file now.", _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 2
+    assert response.choices[0].finish_reason == "stop"
+
+
+@pytest.mark.parametrize("final", ["alpha-beta", "All 4 groups are committed and pushed.", "Done: 391"])
+def test_real_final_answers_are_not_nudged(final):
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, [final])
+    response = _create(client)
+    assert len(agent.messages) == 1
+    assert response.choices[0].message.content == final
+
+
+def test_plan_only_reply_without_tools_is_not_nudged():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll explain the plan."])
+    _create(client, tools=False)
+    assert len(agent.messages) == 1
+
+
+def test_nudge_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_PLAN_NUDGE", "0")
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll read the file.", _CALL])
+    _create(client)
+    assert len(agent.messages) == 1
+
+
+def test_streamed_plan_only_reply_is_nudged_into_a_tool_call():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll read the fix note first.", _CALL])
+    chunks = list(_create(client, stream=True))
+    assert len(agent.messages) == 2
+    calls = _stream_calls(chunks)
+    assert calls and calls[0].function.name == "read_file"
+    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finals == ["tool_calls"]

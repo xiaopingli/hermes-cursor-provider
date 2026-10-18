@@ -4,6 +4,7 @@
 
 - Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@reasoning_effort=xhigh,fast=true`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter variants get separate retained sessions. Verified live: an xhigh+fast selection runs, and an invalid value is rejected by Cursor.
 - Adds opt-in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) so chosen parameter variants appear in the model listing and pass Hermes' `/model` validation.
+- Nudges once when a reply has tools available but ends on a plan ("I'll read the file…") with no `<tool_call>`, instead of returning the announcement as the final answer. Disable with `HERMES_CURSOR_PLAN_NUDGE=0`.
 
 ## 0.3.6
 

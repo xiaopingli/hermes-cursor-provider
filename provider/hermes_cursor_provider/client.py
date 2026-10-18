@@ -8,6 +8,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -469,6 +470,32 @@ def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
     return base, params
 
 
+PLAN_NUDGE = (
+    "Your previous reply announced what you would do but contained no <tool_call> block, so "
+    "nothing was executed. If you intended to use a tool, emit the <tool_call> block now, "
+    "exactly as the protocol above describes, with no other text. If the task is truly "
+    "finished, reply with the final answer instead."
+)
+
+_PLAN_RE = re.compile(
+    r"^\s*(?:(?:first|next|now|ok(?:ay)?|sure|alright)[,!.]?\s+)?"
+    r"(?:i['\u2019]ll|i will|i am going to|i['\u2019]m going to|let me|let['\u2019]s)\b",
+    re.IGNORECASE,
+)
+
+
+def _plan_nudge_enabled() -> bool:
+    return os.environ.get("HERMES_CURSOR_PLAN_NUDGE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _looks_like_plan(text: str | None) -> bool:
+    """A short statement of intent (or a dangling colon) rather than a final answer."""
+    value = str(text or "").strip()
+    if not value or len(value) > 800:
+        return False
+    return bool(_PLAN_RE.match(value)) or value.endswith(":")
+
+
 def _model_id(model: str | None) -> str | None:
     """Normalised model name, including any parameters (used as a session key)."""
     base, params = _split_model(model)
@@ -810,6 +837,30 @@ class CursorSDKClient:
         return client.create_agent(options)
 
     def _run_agent(
+        self,
+        agent: Any,
+        *,
+        prompt: str,
+        images: list[dict[str, str]],
+        allowed_names: set[str],
+        control: _StreamControl | None = None,
+    ) -> Any:
+        """Run one turn; if it ends on a plan with tools available, nudge once for the call.
+
+        Some models (notably Grok at high effort) announce "I'll read the file..." and stop,
+        expecting a native tool call that this prompt-protocol transport never sees. Without
+        a nudge Hermes treats the announcement as the final answer and closes the task."""
+        result, calls, content = yield from self._run_once(
+            agent, prompt=prompt, images=images, allowed_names=allowed_names, control=control
+        )
+        if calls or not allowed_names or not _plan_nudge_enabled() or not _looks_like_plan(content):
+            return result, calls, content
+        result, calls, more = yield from self._run_once(
+            agent, prompt=PLAN_NUDGE, images=[], allowed_names=allowed_names, control=control
+        )
+        return result, calls, "\n\n".join(part for part in (content, more) if part)
+
+    def _run_once(
         self,
         agent: Any,
         *,
