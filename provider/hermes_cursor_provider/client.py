@@ -1056,7 +1056,11 @@ class CursorSDKClient:
             holder=holder,
         )
         if calls:
-            return result, calls, "\n\n".join(part for part in (content, more) if part)
+            # The turn continues with a tool call, but a FINAL: prefix the nudged reply
+            # emitted anyway must not reach the delivered text or session history.
+            return result, calls, "\n\n".join(
+                part for part in (content, _strip_final_marker(more)) if part
+            )
         if not _FINAL_RE.match(str(more or "")):
             # Two strikes: the nudge was answered with another announcement. Raise HERE,
             # before this turn is stored and before the streaming builder emits anything,
@@ -1499,6 +1503,13 @@ class CursorSDKClient:
                 hold.clear()
                 if _FINAL_RE.match(buffered):
                     yield from emit_text(_strip_final_marker(buffered))
+            elif nudged:
+                # A call means this reply continues the turn, but a FINAL: prefix it
+                # emitted anyway must not reach the delivered text (same rule as the
+                # sync join in _run_agent).
+                buffered = _strip_final_marker("".join(hold))
+                hold.clear()
+                yield from emit_text(buffered)
             else:
                 yield from release_hold()
             for index, call in enumerate(calls):

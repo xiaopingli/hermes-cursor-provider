@@ -1413,6 +1413,20 @@ def test_final_marker_is_stripped_from_delivered_text():
     assert "FINAL:" not in content
 
 
+def test_final_marker_is_stripped_when_the_nudged_reply_also_calls():
+    """The marker must not survive the join just because the reply also carries a call."""
+    client, sdk = _sdk_client()
+    _sequenced(
+        sdk,
+        ["I'll check the groups.", "FINAL: I read it and the answer is 42.\n\n" + _CALL],
+    )
+    response = _create(client)
+    assert response.choices[0].finish_reason == "tool_calls"
+    content = response.choices[0].message.content
+    assert content == "I'll check the groups.\n\nI read it and the answer is 42."
+    assert "FINAL:" not in content
+
+
 def test_final_marker_is_accepted_after_a_blank_line():
     client, sdk = _sdk_client()
     _sequenced(sdk, ["I'll check the groups.", "\n\nFINAL: all four groups are green."])
