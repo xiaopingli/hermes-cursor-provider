@@ -1478,6 +1478,18 @@ def test_final_marker_is_stripped_when_the_nudged_reply_also_calls():
     assert "FINAL:" not in content
 
 
+def test_final_marker_is_not_stripped_mid_text():
+    """The strip is a prefix rule: text that never passed the gate is returned unchanged.
+
+    Both ``_strip_final_marker`` call sites pass text that was not prefix-checked, so an
+    unanchored pattern would delete a mid-sentence ``FINAL:`` and the space before it.
+    """
+    text = "See the FINAL: stage now"
+    assert client_module._strip_final_marker(text) == text
+    assert client_module._strip_final_marker("  FINAL: done") == "done"
+    assert client_module._strip_final_marker("\n\nfinal: done") == "done"
+
+
 def test_final_marker_is_accepted_after_a_blank_line():
     client, sdk = _sdk_client()
     _sequenced(sdk, ["I'll check the groups.", "\n\nFINAL: all four groups are green."])
@@ -1574,6 +1586,67 @@ def test_tool_choice_limits_registered_tools():
     # tool_choice="none" offers nothing at all, so the text-only shape is kept.
     assert "custom_tools" not in sdk.options[1]["local"]
     assert sdk.options[1]["tools"] == []
+
+
+@pytest.mark.parametrize("mode", ["one-shot", "session", "busy-session"])
+def test_native_prompt_reaches_the_sdk_at_every_call_site(mode):
+    """Pin the switch where ``_execute`` flips it, not only in ``render_prompt``'s own test.
+
+    The prompt is rendered at three production call sites (the one-shot run, the session
+    run, and the busy-session one-shot fallback). A ``native_tools=False`` at any of them
+    would restore the text protocol while the direct ``render_prompt`` test stayed green.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    scope = "scope-native-prompt"
+    try:
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "read the file"}],
+            tools=[_tool()],
+            _cursor_session_scope=None if mode == "one-shot" else scope,
+        )
+        if mode == "busy-session":
+            session = next(iter(client_module._SESSIONS.values()))
+            assert session.lock.acquire(blocking=False)
+            try:
+                client.chat.completions.create(
+                    model="grok-4.7",
+                    messages=[
+                        {"role": "user", "content": "read the file"},
+                        {"role": "assistant", "content": "hello"},
+                        {"role": "user", "content": "continue"},
+                    ],
+                    tools=[_tool()],
+                    _cursor_session_scope=scope,
+                )
+            finally:
+                session.lock.release()
+    finally:
+        client.close()
+    # The last agent is the one this mode's call site served: the session agent for
+    # one-shot/session, the closing one-shot agent for the busy-session fallback.
+    sent = sdk.agents[-1].messages[-1]["text"]
+    assert "offered as native tool calls" in sent
+    assert "call it directly with the native tool-call mechanism" in sent
+    assert "<tool_call>" not in sent
+    assert '"name":"read_file"' in sent
+
+
+def test_no_tools_turn_never_gets_the_native_prompt():
+    """Without tools the SDK keeps the plain-text instruction; the native switch is off."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        client.chat.completions.create(
+            model="grok-4.7", messages=[{"role": "user", "content": "hello"}]
+        )
+    finally:
+        client.close()
+    sent = sdk.agents[0].messages[0]["text"]
+    assert "offered as native tool calls" not in sent
+    assert "<tool_call>" not in sent
+    assert "No Hermes tools are available for this request. Answer in plain text." in sent
 
 
 def test_no_tools_keeps_text_protocol():
