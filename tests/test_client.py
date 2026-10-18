@@ -221,6 +221,22 @@ def _stream_calls(chunks):
     ]
 
 
+def _first_chunk_index(chunks, predicate):
+    return next(
+        index
+        for index, chunk in enumerate(chunks)
+        if chunk.choices and predicate(chunk.choices[0])
+    )
+
+
+def _assert_held_text_precedes_call_deltas(chunks):
+    """Order at run end: held text -> tool-call deltas -> finish chunk."""
+    text = _first_chunk_index(chunks, lambda choice: bool(choice.delta.content))
+    call = _first_chunk_index(chunks, lambda choice: bool(choice.delta.tool_calls))
+    finish = _first_chunk_index(chunks, lambda choice: bool(choice.finish_reason))
+    assert text < call < finish
+
+
 def _scripted_run(sdk, script):
     run = ScriptedRun(sdk.result, script)
     agent = FakeAgent(sdk)
@@ -255,6 +271,36 @@ def test_prompt_keeps_hermes_authoritative_and_filters_tool_choice():
     assert '"name":"read_file"' in prompt
     assert '"name":"write_file"' not in prompt
     assert render_prompt([], tools=[_tool()], tool_choice="none")[1] == set()
+
+
+def test_native_prompt_drops_the_text_protocol():
+    prompt, allowed = render_prompt(
+        [{"role": "user", "content": "inspect it"}],
+        tools=[_tool()],
+        native_tools=True,
+    )
+    assert allowed == {"read_file"}
+    assert "offered as native tool calls" in prompt
+    assert "call it directly with the native tool-call mechanism" in prompt
+    assert "<tool_call>" not in prompt
+    assert '"name":"read_file"' in prompt
+
+    # The default (no native tools) still instructs the <tool_call> block protocol.
+    text_prompt, _ = render_prompt([{"role": "user", "content": "inspect it"}], tools=[_tool()])
+    assert "<tool_call>" in text_prompt
+    assert "offered as native tool calls" not in text_prompt
+
+    # tool_choice="none" offers no tools at all, so neither protocol is advertised.
+    none_prompt, none_allowed = render_prompt(
+        [{"role": "user", "content": "inspect it"}],
+        tools=[_tool()],
+        tool_choice="none",
+        native_tools=True,
+    )
+    assert none_allowed == set()
+    assert "<tool_call>" not in none_prompt
+    assert "offered as native tool calls" not in none_prompt
+    assert "No Hermes tools are available" in none_prompt
 
 
 def test_tool_call_parser_accepts_only_offered_valid_calls():
@@ -1695,6 +1741,8 @@ def test_stream_emits_native_tool_call_deltas():
     finally:
         client.close()
     assert sdk.tool_callbacks == ["queued"]
+    assert _stream_text(chunks) == "hello"
+    _assert_held_text_precedes_call_deltas(chunks)
     calls = _stream_calls(chunks)
     assert calls and calls[0].function.name == "hermes_ping"
     assert calls[0].function.arguments == '{"token":"probe-1"}'
@@ -1883,10 +1931,37 @@ def test_nudged_reply_native_call_flushes_and_finishes():
     finally:
         client.close()
     assert _stream_text(chunks) == "Checking now."  # the announcement is dropped at the boundary
+    _assert_held_text_precedes_call_deltas(chunks)
     calls = _stream_calls(chunks)
     assert [call.function.name for call in calls] == ["hermes_ping"]
     finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
     assert finals == ["tool_calls"]
+
+
+def test_nudged_reply_marker_is_stripped_before_native_call_deltas():
+    """A nudged reply that prefixes FINAL: AND calls must not leak the token to chunks."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+
+    def call_event(run):
+        entry = sdk.options[-1]["local"]["custom_tools"]["hermes_ping"]
+        sdk.tool_callbacks.append(
+            entry["execute"]({"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe"))
+        )
+        return SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
+
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll check.")], [_assistant_event("FINAL: Checking now."), call_event]],
+    )
+    try:
+        chunks = list(_streamed(client, tools=("hermes_ping",)))
+    finally:
+        client.close()
+    content = _stream_text(chunks)
+    assert content == "Checking now."
+    assert "FINAL:" not in content
 
 
 def test_stream_heartbeats_while_holding(monkeypatch):
