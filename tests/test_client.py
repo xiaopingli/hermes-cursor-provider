@@ -1442,12 +1442,17 @@ def test_announcement_with_pleasantry_is_still_nudged():
 
 
 def test_final_prefixed_answer_is_never_raised():
+    """The marker, not the plan heuristic, accepts the nudged reply."""
     client, sdk = _sdk_client()
-    agent = _sequenced(sdk, ["FINAL: all four groups are green.", _CALL])
+    agent = _sequenced(
+        sdk, ["I'll check the groups.", "FINAL: I'll re-read it and then answer."]
+    )
     response = _create(client)
-    assert len(agent.messages) == 1
+    assert len(agent.messages) == 2
     assert response.choices[0].finish_reason == "stop"
-    assert response.choices[0].message.content == "FINAL: all four groups are green."
+    content = response.choices[0].message.content
+    assert content == "I'll check the groups.\n\nI'll re-read it and then answer."
+    assert "FINAL:" not in content
 
 
 def test_final_marker_is_stripped_from_delivered_text():
@@ -1713,6 +1718,28 @@ def test_stale_callback_name_is_dropped():
     holder["active"] = True
     assert stale({"path": "x"}, SimpleNamespace(tool_call_id=None)).startswith("refused:")
     assert holder["sink"] == []
+
+
+def test_turn_cap_refuses_the_seventeenth_callback():
+    """The 16-call cap is a hard stop: the 17th callback is refused, not queued."""
+    holder = {
+        "sink": [],
+        "allowed": {"read_file"},
+        "registered": {"read_file"},
+        "active": True,
+    }
+    specs = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
+    execute = client_module.hermes_tools_as_custom_tools(specs, holder)["read_file"]["execute"]
+    acks = [
+        execute({"path": f"f{index}.txt"}, SimpleNamespace(tool_call_id=f"call_{index}"))
+        for index in range(17)
+    ]
+    assert acks[:16] == ["queued"] * 16
+    assert acks[16] == "refused: too many tool calls in one turn; state the final answer now"
+    assert len(holder["sink"]) == 16
+    assert [entry["tool_call_id"] for entry in holder["sink"]] == [
+        f"call_{index}" for index in range(16)
+    ]
 
 
 def test_plan_with_zero_callbacks_is_an_error():
