@@ -925,6 +925,13 @@ def test_async_stream_cancellation_cancels_run_and_releases_session():
 
         task = asyncio.create_task(consume())
         assert await asyncio.to_thread(blocked.wait, 5), "async pull never reached the blocked read"
+        # The SDK loop now runs ahead of the consumer (its work is pumped on a worker
+        # thread), so "the SDK reached the next read" no longer implies the first
+        # chunk was pulled. Wait for the delivery itself before cancelling.
+        deadline = time.monotonic() + 5
+        while not seen and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert seen, "the first chunk was never delivered"
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -2062,6 +2069,93 @@ def test_nudged_reply_marker_is_stripped_before_native_call_deltas():
     content = _stream_text(chunks)
     assert content == "Checking now."
     assert "FINAL:" not in content
+
+
+def test_run_timeout_is_configurable_and_defaults_to_thirty_minutes(monkeypatch):
+    """The cap has a stated default and one lever; a malformed value cannot disable it."""
+    monkeypatch.delenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", raising=False)
+    assert client_module._run_timeout_seconds() == 1800.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "45")
+    assert client_module._run_timeout_seconds() == 45.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "not-a-number")
+    assert client_module._run_timeout_seconds() == 1800.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "0")
+    assert client_module._run_timeout_seconds() == 1800.0
+
+
+class StalledRun(FakeRun):
+    """A run that never reaches the SDK: stream() and wait() block until released."""
+
+    def __init__(self, result, started, release):
+        super().__init__(result)
+        self.started = started
+        self.release = release
+
+    def stream(self):
+        self.started.set()
+        self.release.wait(5)
+        yield _assistant_event("")
+
+    def wait(self):
+        self.release.wait(5)
+        return self._result
+
+
+def test_stalled_sdk_run_raises_the_timeout_instead_of_hanging(monkeypatch):
+    """A call that never returns must fail the turn, not hold it open forever."""
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "0.2")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    started, release = threading.Event(), threading.Event()
+    run = StalledRun(sdk.result, started, release)
+    agent = FakeAgent(sdk)
+    agent.send = lambda message: run
+    sdk.create_agent = lambda options: agent
+    began = time.monotonic()
+    try:
+        with pytest.raises(client_module.CursorSDKRunError) as exc_info:
+            client.chat.completions.create(
+                model="grok-4.7",
+                messages=[{"role": "user", "content": "hi"}],
+                _cursor_session_scope="scope-stalled",
+            )
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        client.close()
+    assert exc_info.value.error_code == "cursor_run_timeout"
+    assert exc_info.value.status_code == 408
+    assert "HERMES_CURSOR_RUN_TIMEOUT_SECONDS" in str(exc_info.value)
+    assert elapsed < 3, "the stall outlived its cap"
+    assert started.is_set() and run.cancelled
+    session = next(iter(client_module._SESSIONS.values()))
+    assert session.agent is None and session.history == []
+    assert not session.lock.locked()
+
+
+def test_stalled_streamed_run_raises_before_any_content(monkeypatch):
+    """The stall raise lands inside the held reply, so no content delta softens it."""
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "0.2")
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    release = threading.Event()
+
+    def stall(run):
+        release.wait(5)
+        return _assistant_event("")
+
+    _stream_agent(sdk, [[_assistant_event("I'll read the file."), stall]])
+    seen = []
+    try:
+        with pytest.raises(client_module.CursorSDKRunError) as exc_info:
+            for chunk in _streamed(client):
+                seen.append(chunk)
+    finally:
+        release.set()
+        client.close()
+    assert exc_info.value.error_code == "cursor_run_timeout"
+    assert seen == []
 
 
 def test_stream_heartbeats_while_holding(monkeypatch):

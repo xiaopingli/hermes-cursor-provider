@@ -95,3 +95,22 @@ def test_usage_limit_keeps_its_own_verdict(tree_profile):
     assert verdict.reason == FailoverReason.rate_limit
     assert verdict.status_code == 429
     assert verdict.should_rotate_credential is True
+
+
+def test_run_timeout_is_not_swallowed_by_the_plan_only_hook(tree_profile):
+    """The hook stays scoped to ``cursor_plan_only``: a stalled run must stay retryable.
+
+    A stall is transient, so it deliberately does NOT get the plan-only terminal
+    verdict; it keeps the core's own 408/timeout handling (retry, not fail-closed).
+    """
+    exc = _error(
+        tree_profile,
+        "Cursor SDK run did not finish within 1800s (1800s elapsed); Hermes stopped waiting",
+        status_code=408,
+        error_code="cursor_run_timeout",
+        body={"error": {"code": "cursor_run_timeout"}},
+    )
+    verdict = classify_api_error(exc, provider="cursor", model="grok-4.7")
+    assert verdict.reason == FailoverReason.timeout
+    assert verdict.retryable is True
+    assert verdict.should_fallback is False

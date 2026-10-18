@@ -9,6 +9,7 @@ import importlib
 import json
 import logging
 import os
+import queue
 import re
 import shutil
 import tempfile
@@ -29,6 +30,11 @@ _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
 _MAX_TURN_TOOL_CALLS = 16
 _STREAM_HEARTBEAT_SECONDS = 60.0
+# Wall-clock cap for one Cursor SDK run. The SDK's send/stream/wait path has no bounded
+# wait of its own; without this a stalled run holds the Hermes turn open indefinitely.
+_DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
+_MIN_RUN_TIMEOUT_SECONDS = 0.05
+_MAX_RUN_TIMEOUT_SECONDS = 86_400.0
 
 
 class CursorSDKRunError(RuntimeError):
@@ -712,6 +718,40 @@ def _max_sessions() -> int:
     return max(1, min(value, 128))
 
 
+def _run_timeout_seconds() -> float:
+    """How long one SDK run may take before the plugin stops waiting, in seconds.
+
+    Default 1800 s (30 min): the longest legitimate call seen in the acceptance harness
+    was 11.6 min on a 3.9M-token input, so 30 min leaves ~2.5x headroom while still
+    failing well before a 45-60 min run-kill. A malformed or non-positive value falls
+    back to the default — the cap exists to stop the hang, so it cannot be switched off.
+    """
+    raw = os.environ.get("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("cursor: ignoring malformed HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    if value <= 0:
+        logger.warning("cursor: ignoring non-positive HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+        return _DEFAULT_RUN_TIMEOUT_SECONDS
+    return min(max(value, _MIN_RUN_TIMEOUT_SECONDS), _MAX_RUN_TIMEOUT_SECONDS)
+
+
+def _run_timeout_error(cap: float, elapsed: float) -> CursorSDKRunError:
+    """The loud end of a stalled run: a timeout Hermes can retry or fall back from."""
+    return CursorSDKRunError(
+        f"Cursor SDK run did not finish within {cap:g}s ({elapsed:g}s elapsed); Hermes "
+        "stopped waiting instead of hanging the turn. Raise "
+        "HERMES_CURSOR_RUN_TIMEOUT_SECONDS if this workload legitimately needs longer.",
+        status_code=408,
+        error_code="cursor_run_timeout",
+        body={"error": {"code": "cursor_run_timeout"}},
+    )
+
+
 def _load_cursor_client() -> Any:
     try:
         return importlib.import_module("cursor_sdk").CursorClient
@@ -854,6 +894,125 @@ class _StreamControl:
 
     run: Any = None
     closed: bool = False
+
+
+class _RunPump:
+    """One Cursor SDK run on its own daemon thread, posting progress to a queue.
+
+    ``Agent.send``, the event stream and ``run.wait()`` block for as long as Cursor
+    takes and the SDK offers no bounded wait, so running them on the caller's thread
+    leaves a turn with no way to stop waiting. The blocking work happens here instead
+    and the caller reads ``queue`` against a wall-clock deadline; when it overruns, the
+    caller raises after :meth:`cancel`. Trade-off: a worker wedged inside the SDK is
+    abandoned (daemon thread) rather than joined — a bounded turn, and one lost thread
+    only when the run was already pathological.
+    """
+
+    EVENT = "event"
+    TEXT = "text"
+    CALL_ID = "call_id"
+    DONE = "done"
+    ERROR = "error"
+
+    def __init__(
+        self,
+        client: "CursorSDKClient",
+        agent: Any,
+        payload: dict[str, Any],
+        control: _StreamControl | None,
+    ) -> None:
+        self._client = client
+        self._agent = agent
+        self._payload = payload
+        self._control = control
+        self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.run: Any = None
+        self.abandoned = False
+        self._thread = threading.Thread(
+            target=self._work, name="cursor-sdk-run", daemon=True
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def cancel(self) -> None:
+        """Stop waiting: cancel the run if it exists yet; the worker exits on its next step."""
+        self.abandoned = True
+        run = self.run
+        if run is not None:
+            with suppress(Exception):
+                run.cancel()
+
+    def _work(self) -> None:
+        try:
+            result, failure = self._collect()
+        except BaseException as exc:  # noqa: BLE001 - the caller re-raises it
+            self._settle()
+            self.queue.put((self.ERROR, exc))
+            return
+        self._settle()
+        self.queue.put((self.DONE, (result, failure)))
+
+    def _collect(self) -> tuple[Any, str]:
+        run = self._agent.send(self._payload)
+        self.run = run
+        with self._client._runs_lock:
+            self._client._runs.add(run)
+        if self._control is not None:
+            self._control.run = run
+        if self.abandoned or self._client.is_closed or (
+            self._control is not None and self._control.closed
+        ):
+            raise CursorSDKRunError("Cursor stream cancelled during startup")
+        failure = ""
+        stream = getattr(run, "stream", None)
+        if callable(stream):
+            for event in cast(Iterable[Any], stream()):
+                if self.abandoned:
+                    raise CursorSDKRunError("Cursor SDK run abandoned after the wait deadline")
+                kind = str(getattr(event, "type", ""))
+                # A heartbeat point for the streaming builder, which is chunk-silent
+                # while it holds a reply (thinking events included).
+                self.queue.put((self.EVENT, None))
+                if kind == "tool_call":
+                    self.queue.put(
+                        (self.CALL_ID, _normalise_call_id(getattr(event, "call_id", None)))
+                    )
+                elif kind == "assistant":
+                    payload = getattr(event, "message", None)
+                    for block in getattr(payload, "content", ()) or ():
+                        text = str(getattr(block, "text", "") or "")
+                        if text:
+                            self.queue.put((self.TEXT, text))
+                elif kind == "status":
+                    status = str(getattr(event, "status", "") or "").upper()
+                    if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                        failure = str(getattr(event, "message", "") or status)
+        else:
+            iter_text = getattr(run, "iter_text", None)
+            if callable(iter_text):
+                for part in cast(Iterable[str], iter_text()):
+                    if self.abandoned:
+                        raise CursorSDKRunError("Cursor SDK run abandoned after the wait deadline")
+                    self.queue.put((self.EVENT, None))
+                    text = str(part or "")
+                    if text:
+                        self.queue.put((self.TEXT, text))
+        result = run.wait()
+        return result, failure
+
+    def _settle(self) -> None:
+        """Report the run out of flight *before* the caller sees the report.
+
+        A caller reacting to ``DONE``/``ERROR`` must never observe the run still in
+        ``client._runs`` or still reachable from ``control.run`` for cancellation.
+        """
+        run = self.run
+        if run is not None:
+            with self._client._runs_lock:
+                self._client._runs.discard(run)
+        if self._control is not None and self._control.run is run:
+            self._control.run = None
 
 
 class _LazyStream:
@@ -1102,50 +1261,42 @@ class CursorSDKClient:
         Returns (result, calls, content) — the extraction the buffered path used,
         produced incrementally so callers see text before the SDK run completes.
         ``calls`` is the merged list: this run's reconciled native calls, or the
-        honoured parser calls when none were delivered."""
+        honoured parser calls when none were delivered.
+
+        The blocking SDK work runs on a ``_RunPump`` thread; this generator reads its
+        queue against a wall-clock deadline, so a stalled run raises instead of
+        holding the turn open.
+        """
         parser = _ToolBlockStream(allowed_names)
         event_ids: set[str] = set()
-        run = None
+        cap = _run_timeout_seconds()
+        started = time.monotonic()
+        deadline = started + cap
+        pump = _RunPump(self, agent, {"text": prompt, "images": images}, control)
+        pump.start()
+        streamed = ""
         try:
-            run = agent.send({"text": prompt, "images": images})
-            with self._runs_lock:
-                self._runs.add(run)
-            if control is not None:
-                control.run = run
-                if control.closed or self.is_closed:
-                    raise CursorSDKRunError("Cursor stream cancelled during startup")
-            streamed = ""
-            failure = ""
-            stream = getattr(run, "stream", None)
-            if callable(stream):
-                for event in cast(Iterable[Any], stream()):
-                    kind = str(getattr(event, "type", ""))
+            while True:
+                try:
+                    kind, value = pump.queue.get(
+                        timeout=max(deadline - time.monotonic(), 0.0)
+                    )
+                except queue.Empty:
+                    raise _run_timeout_error(cap, time.monotonic() - started) from None
+                if kind == _RunPump.EVENT:
                     # A heartbeat point for the streaming builder, which is chunk-silent
                     # while it holds a reply (thinking events included).
                     yield ("event", None)
-                    if kind == "tool_call":
-                        event_ids.add(_normalise_call_id(getattr(event, "call_id", None)))
-                    if kind == "assistant":
-                        payload = getattr(event, "message", None)
-                        for block in getattr(payload, "content", ()) or ():
-                            text = str(getattr(block, "text", "") or "")
-                            if text:
-                                streamed += text
-                                yield from parser.feed(text)
-                    elif kind == "status":
-                        status = str(getattr(event, "status", "") or "").upper()
-                        if status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                            failure = str(getattr(event, "message", "") or status)
-            else:
-                iter_text = getattr(run, "iter_text", None)
-                if callable(iter_text):
-                    for part in cast(Iterable[str], iter_text()):
-                        yield ("event", None)
-                        text = str(part or "")
-                        if text:
-                            streamed += text
-                            yield from parser.feed(text)
-            result = run.wait()
+                elif kind == _RunPump.CALL_ID:
+                    event_ids.add(value)
+                elif kind == _RunPump.TEXT:
+                    streamed += value
+                    yield from parser.feed(value)
+                elif kind == _RunPump.DONE:
+                    result, failure = value
+                    break
+                else:  # _RunPump.ERROR: the SDK work raised on the worker thread
+                    raise value
             status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
             status = str(status_value or "").upper()
             if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
@@ -1156,16 +1307,10 @@ class CursorSDKClient:
             yield from parser.flush()
             return result, _merged_calls(holder, event_ids, parser.calls), parser.text
         except BaseException:
-            if run is not None:
-                with suppress(Exception):
-                    run.cancel()
+            # Cancelling is how the worker is stopped: it may be blocked inside the SDK
+            # with no other way to observe that nobody is reading its queue any more.
+            pump.cancel()
             raise
-        finally:
-            if control is not None:
-                control.run = None
-            if run is not None:
-                with self._runs_lock:
-                    self._runs.discard(run)
 
     def _run_ephemeral(
         self,
