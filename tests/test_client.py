@@ -4,6 +4,7 @@ import asyncio
 import base64
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import threading
 import time
 from types import SimpleNamespace
@@ -85,6 +86,33 @@ class FailingRun(FakeRun):
         raise TimeoutError("run timed out")
 
 
+class ToolCallbackRun(FakeRun):
+    """Fires the registered custom tool mid-stream, as the SDK's loopback callback does.
+
+    The real SDK calls ``local.custom_tools[name].execute`` while the run is streaming
+    and emits a ``tool_call`` event carrying the same id; both halves are faked here so
+    the sink entry and the run's event ids can be reconciled.
+    """
+
+    def __init__(self, owner, name):
+        super().__init__(owner.result)
+        self.owner = owner
+        self.name = name
+        self.callback_result = None
+
+    def stream(self):
+        options = self.owner.options[-1] if self.owner.options else {}
+        tools = (options.get("local") or {}).get("custom_tools") or {}
+        entry = tools.get(self.name)
+        if entry is not None:
+            self.callback_result = entry["execute"](
+                {"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe")
+            )
+            self.owner.tool_callbacks.append(self.callback_result)
+            yield SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
+        yield from super().stream()
+
+
 class FakeAgent:
     def __init__(self, owner):
         self.owner = owner
@@ -94,6 +122,12 @@ class FakeAgent:
     def send(self, message):
         self.owner.messages.append(message)
         self.messages.append(message)
+        # Only the newest transcript entry may request a call: the rendered prompt
+        # replays earlier user turns, and those must not re-trigger the callback.
+        tail = str((message or {}).get("text", "")).rsplit('{"role":"user"', 1)[-1]
+        match = re.search(r"CALL\s+(\w+)", tail)
+        if match:
+            return ToolCallbackRun(self.owner, match.group(1))
         return FakeRun(self.owner.result)
 
     def close(self):
@@ -109,6 +143,7 @@ class FakeCursorClient:
         self.options = []
         self.messages = []
         self.agents = []
+        self.tool_callbacks = []
         self.closed = False
         self.result = FakeResult(
             result="hello",
@@ -1318,3 +1353,272 @@ def test_streamed_plan_only_reply_is_nudged_into_a_tool_call():
     assert calls and calls[0].function.name == "read_file"
     finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
     assert finals == ["tool_calls"]
+
+
+# --- Hermes tools inside Cursor's native loop (custom_tools) ---
+
+
+def test_offered_tools_are_custom_tools():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "say hello"}],
+            tools=[_tool()],
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    local = sdk.options[0]["local"]
+    assert set(local["custom_tools"]) == {"read_file"}
+    assert local["custom_tools"]["read_file"]["description"] == "Read one file"
+    assert local["custom_tools"]["read_file"]["input_schema"] == _tool()["function"]["parameters"]
+    assert callable(local["custom_tools"]["read_file"]["execute"])
+
+
+def test_create_agent_offers_only_mcp_tools():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "say hello"}],
+            tools=[_tool()],
+        )
+    finally:
+        client.close()
+    options = FakeCursorClient.instances[0].options[0]
+    # "mcp" is the only capability group that still offers custom_tools; it exposes
+    # no Cursor built-ins (probe-variants.json: every event is name='mcp').
+    assert options["tools"] == ["mcp"]
+    assert options["mcp_servers"] == {}
+
+
+def test_tool_choice_limits_registered_tools():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[_tool(), _tool("write_file")],
+            tool_choice={"type": "function", "function": {"name": "read_file"}},
+        )
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[_tool()],
+            tool_choice="none",
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert set(sdk.options[0]["local"]["custom_tools"]) == {"read_file"}
+    assert sdk.options[0]["tools"] == ["mcp"]
+    # tool_choice="none" offers nothing at all, so the text-only shape is kept.
+    assert "custom_tools" not in sdk.options[1]["local"]
+    assert sdk.options[1]["tools"] == []
+
+
+def test_no_tools_keeps_text_protocol():
+    """Regression guard: without Hermes tools Cursor still gets no tools at all."""
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        response = client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+    finally:
+        client.close()
+    options = FakeCursorClient.instances[0].options[0]
+    assert options["tools"] == []
+    assert "custom_tools" not in options["local"]
+    assert response.choices[0].finish_reason == "stop"
+
+
+def test_callback_returns_tool_call_to_hermes():
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        response = client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "CALL hermes_ping with token probe-1"}],
+            tools=[_tool("hermes_ping")],
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.tool_callbacks == ["queued"]
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    call = choice.message.tool_calls[0]
+    assert call.id == call.call_id == "call_probe"
+    assert call.type == "function"
+    assert call.function.name == "hermes_ping"
+    assert call.function.arguments == '{"token":"probe-1"}'
+
+
+def _native_turn_messages(content, call):
+    return [
+        {"role": "user", "content": "CALL hermes_ping first"},
+        {
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.function.name, "arguments": call.function.arguments},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call.id, "content": "pong:probe-1"},
+        {"role": "user", "content": "CALL hermes_ping again"},
+    ]
+
+
+def test_second_turn_call_lands_on_that_turn():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        first = client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "CALL hermes_ping first"}],
+            tools=[_tool("hermes_ping")],
+            _cursor_session_scope="scope-native-turn2",
+        )
+        call = first.choices[0].message.tool_calls[0]
+        second = client.chat.completions.create(
+            model="grok-4.7",
+            messages=_native_turn_messages(first.choices[0].message.content, call),
+            tools=[_tool("hermes_ping")],
+            _cursor_session_scope="scope-native-turn2",
+        )
+    finally:
+        client.close()
+    assert len(sdk.agents) == 1
+    assert len(sdk.agents[0].messages) == 2
+    assert len(first.choices[0].message.tool_calls) == 1
+    assert len(second.choices[0].message.tool_calls) == 1
+    assert second.choices[0].message.tool_calls[0].id == "call_probe"
+
+
+def test_assistant_echo_round_trips_for_next_turn():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        first = client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "CALL hermes_ping first"}],
+            tools=[_tool("hermes_ping")],
+            _cursor_session_scope="scope-native-echo",
+        )
+        call = first.choices[0].message.tool_calls[0]
+        messages = _native_turn_messages(first.choices[0].message.content, call)
+        messages[-1] = {"role": "user", "content": "thanks, continue"}
+        second = client.chat.completions.create(
+            model="grok-4.7",
+            messages=messages,
+            tools=[_tool("hermes_ping")],
+            _cursor_session_scope="scope-native-echo",
+        )
+    finally:
+        client.close()
+    # The assistant echo round-trips, so the `extends` check keeps the same agent.
+    assert len(sdk.agents) == 1
+    assert len(sdk.agents[0].messages) == 2
+    delta = sdk.agents[0].messages[1]["text"]
+    assert '"content":"thanks, continue"' in delta
+    assert '"tool_call_id":"call_probe"' in delta
+    assert '"content":"CALL hermes_ping first"' not in delta
+    assert second.choices[0].finish_reason == "stop"
+
+
+def test_stale_callback_name_is_dropped():
+    """A callback bound to an earlier turn's set is refused by the LIVE allowed set."""
+    holder = {
+        "sink": [],
+        "allowed": {"read_file"},
+        "registered": {"read_file"},
+        "active": True,
+    }
+    specs = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
+    tools = client_module.hermes_tools_as_custom_tools(specs, holder)
+    stale = tools["read_file"]["execute"]
+    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == "queued"
+    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_stale"]
+
+    # Rebind the SAME dict for the next turn, which did not offer read_file.
+    holder["sink"] = []
+    holder["allowed"] = {"write_file"}
+    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == (
+        "refused: tool not offered this turn"
+    )
+    assert holder["sink"] == []
+
+    # Outside the run window, and without an id, nothing is ever accepted.
+    holder["active"] = False
+    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_x")) == "refused: no active turn"
+    holder["allowed"] = {"read_file"}
+    holder["active"] = True
+    assert stale({"path": "x"}, SimpleNamespace(tool_call_id=None)).startswith("refused:")
+    assert holder["sink"] == []
+
+
+def test_plan_with_zero_callbacks_is_an_error():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll read the file.", "I'll read the file now."])
+    with pytest.raises(client_module.CursorSDKRunError) as exc_info:
+        _create(client)
+    assert exc_info.value.error_code == "cursor_plan_only"
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.body == {"error": {"code": "cursor_plan_only"}}
+    assert len(agent.messages) == 2
+
+
+def test_stream_emits_native_tool_call_deltas():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        chunks = list(
+            client.chat.completions.create(
+                model="grok-4.7",
+                messages=[{"role": "user", "content": "CALL hermes_ping please"}],
+                tools=[_tool("hermes_ping")],
+                stream=True,
+            )
+        )
+    finally:
+        client.close()
+    assert sdk.tool_callbacks == ["queued"]
+    calls = _stream_calls(chunks)
+    assert calls and calls[0].function.name == "hermes_ping"
+    assert calls[0].function.arguments == '{"token":"probe-1"}'
+    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finals == ["tool_calls"]
+
+
+def test_toolset_change_recreate_resends_transcript():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    try:
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[{"role": "user", "content": "first-user"}],
+            tools=[_tool("read_file")],
+            _cursor_session_scope="scope-toolset",
+        )
+        client.chat.completions.create(
+            model="grok-4.7",
+            messages=[
+                {"role": "user", "content": "first-user"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "second-user"},
+            ],
+            tools=[_tool("write_file")],
+            _cursor_session_scope="scope-toolset",
+        )
+    finally:
+        client.close()
+    assert len(sdk.agents) == 2
+    assert sdk.agents[0].closed
+    resent = sdk.agents[1].messages[0]["text"]
+    assert '"content":"first-user"' in resent
+    assert '"content":"second-user"' in resent
