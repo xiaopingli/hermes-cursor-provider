@@ -899,6 +899,7 @@ def test_async_stream_cancellation_cancels_run_and_releases_session():
 
 
 def test_stream_emits_plain_text_before_an_incomplete_tool_block_completes():
+    """A tool-enabled turn holds its text until the decision point, then emits it whole."""
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
     text = (
@@ -927,10 +928,10 @@ def test_stream_emits_plain_text_before_an_incomplete_tool_block_completes():
     worker.start()
     try:
         worker.join(2)
-        assert not worker.is_alive(), "plain text was held until the tool block completed"
-        assert holder["chunk"].choices[0].delta.content == "answer"
-        assert not _stream_calls([holder["chunk"]])
+        assert worker.is_alive(), "tool-enabled text was emitted before the turn's decision point"
         gate.set()
+        worker.join(5)
+        assert not worker.is_alive()
         rest = list(iterator)
     finally:
         gate.set()
@@ -1706,3 +1707,190 @@ def test_toolset_change_recreate_resends_transcript():
     resent = sdk.agents[1].messages[0]["text"]
     assert '"content":"first-user"' in resent
     assert '"content":"second-user"' in resent
+
+
+# --- streaming: hold the reply until the turn decides, then emit in a fixed order ---
+
+
+def _stream_agent(sdk, scripts):
+    """Agent whose successive sends stream the given SDK events, one script per turn."""
+    agent = FakeAgent(sdk)
+    runs = list(scripts)
+
+    def send(message):
+        agent.messages.append(message)
+        return ScriptedRun(sdk.result, runs.pop(0) if runs else [])
+
+    agent.send = send
+
+    def create(options):
+        sdk.options.append(options)
+        return agent
+
+    sdk.create_agent = create
+    return agent
+
+
+def _streamed(client, tools=("read_file",), messages=None, **kwargs):
+    return client.chat.completions.create(
+        model="grok-4.7",
+        messages=messages or [{"role": "user", "content": "go"}],
+        tools=[_tool(name) for name in tools],
+        stream=True,
+        **kwargs,
+    )
+
+
+def test_plan_only_stream_emits_no_content_before_the_raise():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll read the file.")], [_assistant_event("I'll read it now.")]],
+    )
+    seen = []
+    with pytest.raises(client_module.CursorSDKRunError):
+        for chunk in _streamed(client):
+            seen.append(chunk)
+    client.close()
+    assert seen == []
+
+
+def test_stream_flushes_after_final_marker():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll read the file.")], [_assistant_event("FINAL: nothing to change.")]],
+    )
+    try:
+        chunks = list(_streamed(client))
+    finally:
+        client.close()
+    assert _stream_text(chunks) == "nothing to change."
+    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finals == ["stop"]
+
+
+def test_short_non_plan_streamed_reply_flushes_and_stops():
+    """No nudge was sent, so the hold releases at run end and the turn completes."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    _stream_agent(sdk, [[_assistant_event("Done.")]])
+    try:
+        chunks = list(_streamed(client))
+    finally:
+        client.close()
+    assert _stream_text(chunks) == "Done."
+    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finals == ["stop"]
+
+
+def test_nudged_long_reply_without_marker_raises_with_no_content():
+    """After a nudge the hold never releases on length: the raise precedes every delta."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll read the file.")], [_assistant_event("x" * 900)]],
+    )
+    seen = []
+    with pytest.raises(client_module.CursorSDKRunError):
+        for chunk in _streamed(client):
+            seen.append(chunk)
+    client.close()
+    assert seen == []
+
+
+def test_long_reply_releases_hold_before_run_end():
+    """A pre-nudge reply over the 800-char intent cap is not an announcement; it streams."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    long_text = "A" * 900
+    gate = threading.Event()
+
+    def finish(run):
+        assert gate.wait(10)
+        return _assistant_event("")
+
+    _stream_agent(sdk, [[_assistant_event(long_text), finish]])
+    iterator = iter(_streamed(client))
+    holder = {}
+
+    def pull_first():
+        holder["chunk"] = next(iterator, None)
+
+    worker = threading.Thread(target=pull_first, daemon=True)
+    worker.start()
+    try:
+        worker.join(2)
+        assert not worker.is_alive(), "a >800-char reply was held past the release valve"
+        assert holder["chunk"].choices[0].delta.content == long_text
+        gate.set()
+        rest = list(iterator)
+    finally:
+        gate.set()
+        client.close()
+        worker.join(5)
+    assert _stream_text([holder["chunk"]]) + _stream_text(rest) == long_text
+
+
+def test_nudged_reply_native_call_flushes_and_finishes():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+
+    def call_event(run):
+        entry = sdk.options[-1]["local"]["custom_tools"]["hermes_ping"]
+        sdk.tool_callbacks.append(
+            entry["execute"]({"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe"))
+        )
+        return SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
+
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll check.")], [_assistant_event("Checking now."), call_event]],
+    )
+    try:
+        chunks = list(_streamed(client, tools=("hermes_ping",)))
+    finally:
+        client.close()
+    assert _stream_text(chunks) == "Checking now."  # the announcement is dropped at the boundary
+    calls = _stream_calls(chunks)
+    assert [call.function.name for call in calls] == ["hermes_ping"]
+    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
+    assert finals == ["tool_calls"]
+
+
+def test_stream_heartbeats_while_holding(monkeypatch):
+    """A held stream still emits chunk-shaped keepalives (content=None) well before the kill."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        client_module, "time", SimpleNamespace(monotonic=lambda: clock["t"])
+    )
+
+    def first(run):
+        clock["t"] = 61.0
+        return _assistant_event("I'll read the file.")
+
+    def second(run):
+        clock["t"] = 62.0
+        return _assistant_event("")
+
+    _stream_agent(sdk, [[first, second], [_assistant_event("I'll read it now.")]])
+    seen = []
+    with pytest.raises(client_module.CursorSDKRunError):
+        for chunk in _streamed(client):
+            seen.append(chunk)
+    client.close()
+    beats = [c for c in seen if c.choices and c.choices[0].delta.content is None]
+    assert len(beats) == 1
+    assert not [c for c in seen if c.choices and c.choices[0].delta.content]

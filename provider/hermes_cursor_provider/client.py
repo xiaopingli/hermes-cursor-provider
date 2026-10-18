@@ -13,6 +13,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -27,6 +28,7 @@ CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
 _MAX_TURN_TOOL_CALLS = 16
+_STREAM_HEARTBEAT_SECONDS = 60.0
 
 
 class CursorSDKRunError(RuntimeError):
@@ -1042,6 +1044,9 @@ class CursorSDKClient:
         )
         if calls or not allowed_names or not _plan_nudge_enabled() or not _looks_like_plan(content):
             return result, calls, content
+        # The streaming builder resets its hold here: everything before this point was an
+        # announcement, not the answer.
+        yield ("reply", None)
         result, calls, more = yield from self._run_once(
             agent,
             prompt=PLAN_NUDGE,
@@ -1103,6 +1108,9 @@ class CursorSDKClient:
             if callable(stream):
                 for event in cast(Iterable[Any], stream()):
                     kind = str(getattr(event, "type", ""))
+                    # A heartbeat point for the streaming builder, which is chunk-silent
+                    # while it holds a reply (thinking events included).
+                    yield ("event", None)
                     if kind == "tool_call":
                         event_ids.add(_normalise_call_id(getattr(event, "call_id", None)))
                     if kind == "assistant":
@@ -1120,6 +1128,7 @@ class CursorSDKClient:
                 iter_text = getattr(run, "iter_text", None)
                 if callable(iter_text):
                     for part in cast(Iterable[str], iter_text()):
+                        yield ("event", None)
                         text = str(part or "")
                         if text:
                             streamed += text
@@ -1376,7 +1385,14 @@ class CursorSDKClient:
         _cursor_stream_control: Any = None,
         **_: Any,
     ) -> Any:
-        """Yield OpenAI-shaped chunks while the underlying Cursor run is still in flight."""
+        """Yield OpenAI-shaped chunks while the underlying Cursor run is still in flight.
+
+        On a tool-enabled turn the reply text is HELD until the turn decides: Hermes turns
+        a stream error raised after the first text delta into a partial stub, so the
+        fail-closed raise (``_run_agent``) can only be loud if no content was sent. The
+        hold is per reply: the reply-boundary event drops the announcement, then the
+        nudged reply is held to run end unless it begins with ``FINAL:``.
+        """
         execution = self._execute(
             model=model,
             messages=messages or [],
@@ -1392,9 +1408,13 @@ class CursorSDKClient:
         content_started = False
         pending_ws = ""
         calls: list[Any] = []
+        native = bool(tool_specs(tools, tool_choice))
+        hold: list[str] = []
+        nudged = False
+        last_chunk_at = time.monotonic()
 
         def chunk(*, content: str | None = None, tool_calls: Any = None, finish_reason: str | None = None) -> Any:
-            nonlocal first
+            nonlocal first, last_chunk_at
             delta = SimpleNamespace(
                 role="assistant" if first else None,
                 content=content,
@@ -1403,6 +1423,7 @@ class CursorSDKClient:
                 reasoning_content=None,
             )
             first = False
+            last_chunk_at = time.monotonic()
             return SimpleNamespace(
                 id=stream_id,
                 object="chat.completion.chunk",
@@ -1411,6 +1432,27 @@ class CursorSDKClient:
                 usage=None,
             )
 
+        def emit_text(value: str):
+            nonlocal content_started, pending_ws
+            stripped = value.rstrip()
+            if not stripped:
+                pending_ws += value
+                return
+            if content_started:
+                piece = pending_ws + stripped
+            else:
+                piece = stripped.lstrip()
+            pending_ws = value[len(stripped):]
+            if piece:
+                content_started = True
+                yield chunk(content=piece)
+
+        def release_hold():
+            if hold:
+                buffered = "".join(hold)
+                hold.clear()
+                yield from emit_text(buffered)
+
         try:
             while True:
                 try:
@@ -1418,28 +1460,47 @@ class CursorSDKClient:
                 except StopIteration as stop:
                     result, calls, _ = stop.value
                     break
+                if kind == "reply":
+                    # The announcement is not the answer: drop its held text. (The sync
+                    # path joins both only because it returns one summary string.)
+                    hold.clear()
+                    nudged = True
+                    continue
+                if kind == "event":
+                    # Chunk-shaped keepalive; content=None does not count as a delta, so
+                    # it cannot soften the raise.
+                    if native and time.monotonic() - last_chunk_at > _STREAM_HEARTBEAT_SECONDS:
+                        yield chunk(content=None)
+                    continue
                 if kind == "call":
                     # Buffered: the merged list `_run_once` returns is the only source of
                     # call deltas (a parser call it did not honour must not leak out).
+                    if native and not nudged:
+                        yield from release_hold()  # a call means this reply is not an announcement
                     continue
                 if not value:
                     continue
-                stripped = value.rstrip()
-                if not stripped:
-                    pending_ws += value
+                if not native:
+                    yield from emit_text(value)
                     continue
-                if content_started:
-                    piece = pending_ws + stripped
-                else:
-                    piece = stripped.lstrip()
-                pending_ws = value[len(stripped):]
-                if piece:
-                    content_started = True
-                    yield chunk(content=piece)
+                hold.append(value)
+                if not nudged and len("".join(hold).strip()) > 800:
+                    # Longer than the intent cap: by definition not an announcement.
+                    yield from release_hold()
 
             response_model = str(
                 model or getattr(getattr(result, "model", None), "id", "") or "cursor"
             )
+            if native and not calls and nudged:
+                # The nudged reply: deliver it only when it begins with FINAL:, and strip
+                # the marker (same rule as the _run_agent check). Without the marker
+                # _run_agent has already raised, so there is nothing to flush.
+                buffered = "".join(hold)
+                hold.clear()
+                if _FINAL_RE.match(buffered):
+                    yield from emit_text(_strip_final_marker(buffered))
+            else:
+                yield from release_hold()
             for index, call in enumerate(calls):
                 yield chunk(tool_calls=[_tool_delta(call, index)])
             yield chunk(finish_reason="tool_calls" if calls else "stop")
