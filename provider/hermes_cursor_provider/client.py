@@ -635,7 +635,7 @@ _PLEASANTRY_RE = re.compile(
     re.IGNORECASE,
 )
 
-_FINAL_RE = re.compile(r"\s*FINAL:", re.IGNORECASE)
+_FINAL_RE = re.compile(r"\A\s*FINAL:", re.IGNORECASE)
 
 
 def _plan_nudge_enabled() -> bool:
@@ -660,8 +660,16 @@ def _looks_like_plan(text: str | None) -> bool:
 
 
 def _strip_final_marker(text: str | None) -> str:
-    """Remove a leading ``FINAL:`` (same rule as the check, so a blank line cannot hide it)."""
-    return _FINAL_RE.sub("", str(text or ""), count=1).lstrip()
+    """Remove a leading ``FINAL:``; unmarked text is returned unchanged.
+
+    Same rule as the acceptance check (a blank line cannot hide the marker), but anchored:
+    both call sites pass text that never went through the prefix gate, so an unanchored
+    strip would delete a mid-sentence ``FINAL:`` along with the whitespace before it.
+    """
+    value = str(text or "")
+    if not _FINAL_RE.match(value):
+        return value
+    return _FINAL_RE.sub("", value, count=1).lstrip()
 
 
 def _model_id(model: str | None) -> str | None:
