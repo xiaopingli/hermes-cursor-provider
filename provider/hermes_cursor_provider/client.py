@@ -614,17 +614,26 @@ def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
 
 
 PLAN_NUDGE = (
-    "Your previous reply announced what you would do but contained no <tool_call> block, so "
-    "nothing was executed. If you intended to use a tool, emit the <tool_call> block now, "
-    "exactly as the protocol above describes, with no other text. If the task is truly "
-    "finished, reply with the final answer instead."
+    "Your previous reply announced what you would do but did not call a tool, so nothing "
+    "was executed. If you intended to use a tool, call it now using the tools provided in "
+    "this conversation. If the work is finished, reply with your final answer prefixed by "
+    "`FINAL:`."
 )
 
 _PLAN_RE = re.compile(
-    r"^\s*(?:(?:first|next|now|ok(?:ay)?|sure|alright)[,!.]?\s+)?"
+    r"\b(?:(?:first|next|now|ok(?:ay)?|sure|alright)[,!.]?\s+)?"
     r"(?:i['\u2019]ll|i will|i am going to|i['\u2019]m going to|let me|let['\u2019]s)\b",
     re.IGNORECASE,
 )
+
+# A pleasantry is not a statement of intent when it is the whole reply; it never vetoes
+# an announcement that merely ends politely.
+_PLEASANTRY_RE = re.compile(
+    r"\b(let me know|i'?ll be happy to|would you like)\b",
+    re.IGNORECASE,
+)
+
+_FINAL_RE = re.compile(r"\s*FINAL:", re.IGNORECASE)
 
 
 def _plan_nudge_enabled() -> bool:
@@ -632,11 +641,25 @@ def _plan_nudge_enabled() -> bool:
 
 
 def _looks_like_plan(text: str | None) -> bool:
-    """A short statement of intent (or a dangling colon) rather than a final answer."""
+    """A short statement of intent (or a dangling colon) rather than a final answer.
+
+    The search is unanchored: the motivating failure ("The plan is loaded. Next I'll
+    check…") begins mid-sentence. This gate only decides whether to spend one nudge; the
+    raise is decided by the ``FINAL:`` marker, so a false positive cannot hard-fail an
+    answer that is otherwise complete.
+    """
     value = str(text or "").strip()
     if not value or len(value) > 800:
         return False
-    return bool(_PLAN_RE.match(value)) or value.endswith(":")
+    intent = _PLEASANTRY_RE.sub(" ", value)
+    if not intent.strip(" \t\r\n.!?,;:-"):
+        return False
+    return bool(_PLAN_RE.search(intent)) or value.rstrip().endswith(":")
+
+
+def _strip_final_marker(text: str | None) -> str:
+    """Remove a leading ``FINAL:`` (same rule as the check, so a blank line cannot hide it)."""
+    return _FINAL_RE.sub("", str(text or ""), count=1).lstrip()
 
 
 def _model_id(model: str | None) -> str | None:
@@ -1027,7 +1050,25 @@ class CursorSDKClient:
             control=control,
             holder=holder,
         )
-        return result, calls, "\n\n".join(part for part in (content, more) if part)
+        if calls:
+            return result, calls, "\n\n".join(part for part in (content, more) if part)
+        if not _FINAL_RE.match(str(more or "")):
+            # Two strikes: the nudge was answered with another announcement. Raise HERE,
+            # before this turn is stored and before the streaming builder emits anything,
+            # so Hermes cannot report the turn as completed or swap in another provider.
+            raise CursorSDKRunError(
+                "Cursor announced work twice without a tool call or a FINAL: answer"
+                + (f": {more[:300]!r}" if more else ""),
+                status_code=400,
+                error_code="cursor_plan_only",
+                body={"error": {"code": "cursor_plan_only"}},
+            )
+        logger.info("cursor: accepting the nudged reply with a FINAL marker (raw: %.300r)", more)
+        # Strip the marker from the nudged reply BEFORE the join: the joined string would
+        # otherwise carry it mid-text, and the model would imitate it next turn.
+        return result, calls, "\n\n".join(
+            part for part in (content, _strip_final_marker(more)) if part
+        )
 
     def _run_once(
         self,

@@ -1306,7 +1306,8 @@ def test_plan_only_reply_is_nudged_once_into_a_tool_call(plan):
     agent = _sequenced(sdk, [plan, _CALL])
     response = _create(client)
     assert len(agent.messages) == 2
-    assert "<tool_call>" in agent.messages[1]["text"]
+    assert "call it now using the tools provided in this conversation" in agent.messages[1]["text"]
+    assert "FINAL:" in agent.messages[1]["text"]
     choice = response.choices[0]
     assert choice.finish_reason == "tool_calls"
     assert choice.message.tool_calls[0].function.name == "read_file"
@@ -1315,9 +1316,10 @@ def test_plan_only_reply_is_nudged_once_into_a_tool_call(plan):
 def test_nudge_is_attempted_only_once():
     client, sdk = _sdk_client()
     agent = _sequenced(sdk, ["I'll read the file.", "I'll read the file now.", _CALL])
-    response = _create(client)
+    with pytest.raises(client_module.CursorSDKRunError) as exc_info:
+        _create(client)
     assert len(agent.messages) == 2
-    assert response.choices[0].finish_reason == "stop"
+    assert exc_info.value.error_code == "cursor_plan_only"
 
 
 @pytest.mark.parametrize("final", ["alpha-beta", "All 4 groups are committed and pushed.", "Done: 391"])
@@ -1353,6 +1355,88 @@ def test_streamed_plan_only_reply_is_nudged_into_a_tool_call():
     assert calls and calls[0].function.name == "read_file"
     finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
     assert finals == ["tool_calls"]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["Let me know if you'd like more.", "Would you like me to continue?", "I'll be happy to help."],
+)
+def test_pleasantry_only_replies_are_not_nudged(reply):
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, [reply, _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 1
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == reply
+
+
+def test_mid_sentence_announcement_is_nudged_once():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["The plan is loaded. Next I'll check the groups.", _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 2
+    assert response.choices[0].finish_reason == "tool_calls"
+
+
+def test_announcement_with_pleasantry_is_still_nudged():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll read the file. Let me know if you'd like more.", _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 2
+    assert response.choices[0].finish_reason == "tool_calls"
+
+
+def test_final_prefixed_answer_is_never_raised():
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["FINAL: all four groups are green.", _CALL])
+    response = _create(client)
+    assert len(agent.messages) == 1
+    assert response.choices[0].finish_reason == "stop"
+    assert response.choices[0].message.content == "FINAL: all four groups are green."
+
+
+def test_final_marker_is_stripped_from_delivered_text():
+    client, sdk = _sdk_client()
+    _sequenced(sdk, ["I'll check the groups.", "FINAL: all four groups are green."])
+    response = _create(client)
+    content = response.choices[0].message.content
+    assert content == "I'll check the groups.\n\nall four groups are green."
+    assert "FINAL:" not in content
+
+
+def test_final_marker_is_accepted_after_a_blank_line():
+    client, sdk = _sdk_client()
+    _sequenced(sdk, ["I'll check the groups.", "\n\nFINAL: all four groups are green."])
+    response = _create(client)
+    content = response.choices[0].message.content
+    assert content.endswith("all four groups are green.")
+    assert "FINAL:" not in content
+
+
+def test_quoted_marker_is_not_a_final_answer():
+    """The marker must PREFIX the reply; quoting the nudge does not pass."""
+    client, sdk = _sdk_client()
+    _sequenced(
+        sdk,
+        [
+            "I'll check the groups.",
+            "I could not finish. The nudge asked me to prefix the answer with FINAL: but I did not.",
+        ],
+    )
+    with pytest.raises(client_module.CursorSDKRunError) as exc_info:
+        _create(client)
+    assert exc_info.value.error_code == "cursor_plan_only"
+
+
+def test_legitimate_answer_with_ill_is_nudged_then_marked_final():
+    """A false-positive nudge costs one follow-up, never a hard failure, when marked."""
+    reply = "I'll note that the file is 391 lines long."
+    client, sdk = _sdk_client()
+    _sequenced(sdk, [reply, "FINAL: " + reply])
+    response = _create(client)
+    content = response.choices[0].message.content
+    assert content == reply + "\n\n" + reply
+    assert "FINAL:" not in content
 
 
 # --- Hermes tools inside Cursor's native loop (custom_tools) ---
