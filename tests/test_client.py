@@ -1160,6 +1160,14 @@ from hermes_cursor_provider.client import _model_id, _model_selection
             ]},
         ),
         (
+            "grok-4.7@context=500k,reasoning_effort=xhigh,fast=true",
+            {"id": "grok-4.7", "params": [
+                {"id": "context", "value": "500k"},
+                {"id": "reasoning_effort", "value": "xhigh"},
+                {"id": "fast", "value": "true"},
+            ]},
+        ),
+        (
             "cursor:claude-opus-5-5@ context=1m , effort=max ",
             {"id": "claude-opus-5-5", "params": [
                 {"id": "context", "value": "1m"},
