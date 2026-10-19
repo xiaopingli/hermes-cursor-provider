@@ -10,8 +10,6 @@
 - Bounds the SDK session thread: the agent re-submits its whole accumulated thread on every send, so a long session could ask Cursor to re-read several times the model's declared window (3.9M-token input recorded on a 500k model). The agent is now retired once the last call's reported input reaches the session budget and a fresh one gets the full transcript, so context is kept while the re-read is bounded. The budget follows the model string's own `context=` parameter (`500k` = 500,000); `HERMES_CURSOR_SESSION_TOKEN_BUDGET` overrides it and outranks the parameter, and `off`/`0` disables the policy. With neither present the policy is off and logs once per session.
 
 - Logs stream health per SDK run: one line at exit carrying `mode`, `close`, `events`, `ttfe`, `gap`, `dur`, `in_tokens`, `prompt_chars`, and the `session` id. This makes a stall attributable from logs alone — previously the core's `stream_error_cleanup` closes carried no session id and a stalled run left no line of its own. Counters are updated in the consume loop (no observer thread, nothing on the token path) and the whole logging body is guarded, so diagnostics can never change a run's outcome. Adds `scripts/stream_health.py`, which summarises a log into a stream-health block and marks any session tag it could only infer.
-- Documents that the persistent session path (retained agents, the token budget) requires a caller to pass `_cursor_session_scope`, which Hermes core does not do today; live turns take the ephemeral path.
-
 ## 0.3.6
 
 - Replaces synthesized, post-completion chunks with genuine incremental SDK text streaming for Hermes Relay and async consumers. Awaiting a stream no longer collects the whole run.
