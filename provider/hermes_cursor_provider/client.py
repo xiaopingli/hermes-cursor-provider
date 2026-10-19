@@ -230,6 +230,24 @@ def render_prompt(
             ]
         )
         if specs:
+            # QUARANTINED — unreachable in production, kept deliberately.
+            #
+            # Every production caller passes native_tools=bool(specs) (three sites in _execute,
+            # each one line below its render_prompt call), so this branch is entered only when
+            # specs is empty — and then the `if specs:` guard skips it. The text-protocol block
+            # below is therefore dead code in production: the model is offered real custom tools
+            # instead (see the native_tools branch above).
+            #
+            # It stays because tests/test_client.py:277
+            # (test_native_prompt_drops_the_text_protocol) pins it for the non-native path, and
+            # that pin is a deliberate safety net: if a future caller ever renders a prompt
+            # without native tools, the model must still be told how to request one rather than
+            # silently getting no protocol at all. Do not delete this block without moving that
+            # test's intent first.
+            #
+            # The <tool_call> PARSER is a different thing and is live: _merged_calls (client.py
+            # :489) is reached from the parse path, and it remains the safety net for a model
+            # that emits the block form anyway.
             sections.extend(
                 [
                     "When a tool is needed, output only one or more blocks in this exact form: "
