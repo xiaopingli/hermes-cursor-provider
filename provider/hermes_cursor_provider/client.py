@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 CURSOR_API_URL = "https://api.cursor.com"
 _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
-_MAX_TURN_TOOL_CALLS = 16
+_DEFAULT_MAX_TURN_TOOL_CALLS = 64
+_MAX_MAX_TURN_TOOL_CALLS = 1024
 _STREAM_HEARTBEAT_SECONDS = 60.0
 # Wall-clock cap for one Cursor SDK run. The SDK's send/stream/wait path has no bounded
 # wait of its own; without this a stalled run holds the Hermes turn open indefinitely.
@@ -364,7 +365,15 @@ def _new_tool_holder() -> dict[str, Any]:
     The agent (and therefore the SDK's registered handlers) outlives a turn, so the
     closures must read the *live* dict instead of capturing a list or a name set.
     """
-    return {"sink": [], "allowed": set(), "registered": set(), "active": False}
+    return {
+        "sink": [],
+        "allowed": set(),
+        "registered": set(),
+        "active": False,
+        # Run-scoped dedupe state, published by ``_run_once`` at the start of each run.
+        "gen": 0,
+        "event_ids": set(),
+    }
 
 
 def _normalise_call_id(raw: object) -> str:
@@ -390,12 +399,36 @@ def _call_object_from_entry(entry: dict[str, Any], ordinal: int) -> Any:
     )
 
 
+# What the model reads mid-run. It cannot see a tool result inside the turn (Hermes runs
+# queued calls after the run, by design), so the ack is its only in-turn signal.
+_ACK_ACCEPTED = (
+    "accepted by Hermes: this tool is queued and runs after this turn; its result "
+    "arrives in the next message. Do not call it again with the same arguments."
+)
+_ACK_DUPLICATE = (
+    "already accepted this turn \u2014 this exact call is queued once; do not repeat it. "
+    "Its result arrives in the next message."
+)
+_ACK_REFUSED_LIMIT = (
+    "refused: turn limit of {cap} tool calls reached; the calls already accepted will "
+    "still return their results. State your final answer now."
+)
+_TOOL_DESCRIPTION_SUFFIX = (
+    "\n\n(Hermes executes this tool after your turn; its result arrives in the next "
+    "message. Do not repeat a call you have already made this turn.)"
+)
+
+
 def hermes_tools_as_custom_tools(specs: list[dict[str, Any]], holder: dict[str, Any]) -> dict[str, Any]:
     """Register Hermes tools as Cursor custom tools whose callbacks only queue calls.
 
-    ``execute`` never runs a tool: it records ``{name, arguments, tool_call_id}`` on the
-    current turn's sink and acks. Hermes executes the tool (approvals, logging, the real
-    runner) once the call comes back on the completion.
+    ``execute`` never runs a tool: it records ``{name, arguments, tool_call_id, gen}`` on
+    the current turn's sink and acks. Hermes executes the tool (approvals, logging, the
+    real runner) once the call comes back on the completion.
+
+    Guard order: active -> allowed -> call-id -> dedupe -> cap -> append. A repeat of an
+    already-accepted call in the same run collapses to a duplicate ack without consuming
+    cap budget; an id-less repeat still takes the id refusal.
     """
 
     def execute_factory(name: str) -> Any:
@@ -406,27 +439,46 @@ def hermes_tools_as_custom_tools(specs: list[dict[str, Any]], holder: dict[str, 
             if name not in holder["allowed"]:  # the LIVE set, not a captured one
                 logger.info("cursor: callback for a tool this turn did not offer: %s", name)
                 return "refused: tool not offered this turn"
-            if len(holder["sink"]) >= _MAX_TURN_TOOL_CALLS:
-                logger.info("cursor: refusing tool call %s: turn cap reached", name)
-                return "refused: too many tool calls in one turn; state the final answer now"
             cid = _normalise_call_id(getattr(context, "tool_call_id", None))
             if not cid:  # Cursor omitted the id -> Hermes could never see it
                 logger.info("cursor: refusing tool call %s: Cursor sent no call id", name)
                 return "refused: the call was not delivered (no id); state the final answer"
+            args_dict = dict(args)
+            if _dedupe_enabled() and holder["sink"]:
+                # Run-scoped and reconciled: only an entry from THIS run whose id this run
+                # has seen as a tool_call event (the set ``_merged_calls`` will deliver)
+                # can suppress a repeat, so a dedupe never withholds a call that would run.
+                reconciled = {
+                    _normalise_call_id(value) for value in (holder.get("event_ids") or ())
+                }
+                if any(
+                    e.get("gen") == holder.get("gen", 0)
+                    and _normalise_call_id(e.get("tool_call_id")) in reconciled
+                    and e["name"] == name
+                    and e["arguments"] == args_dict
+                    for e in holder["sink"]
+                ):
+                    logger.info("cursor: duplicate tool call %s collapsed this run", name)
+                    return _ACK_DUPLICATE
+            cap = _max_turn_tool_calls()
+            if len(holder["sink"]) >= cap:
+                logger.info("cursor: refusing tool call %s: turn limit reached", name)
+                return _ACK_REFUSED_LIMIT.format(cap=cap)
             holder["sink"].append(
                 {
                     "name": name,
-                    "arguments": dict(args),
+                    "arguments": args_dict,
                     "tool_call_id": cid,
+                    "gen": holder.get("gen", 0),
                 }
             )
-            return "queued"
+            return _ACK_ACCEPTED
 
         return execute
 
     return {
         spec["name"]: {
-            "description": spec["description"],
+            "description": (spec.get("description") or "") + _TOOL_DESCRIPTION_SUFFIX,
             "input_schema": spec["parameters"],
             "execute": execute_factory(spec["name"]),
         }
@@ -648,6 +700,10 @@ def _plan_nudge_enabled() -> bool:
     return os.environ.get("HERMES_CURSOR_PLAN_NUDGE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+def _dedupe_enabled() -> bool:
+    return os.environ.get("HERMES_CURSOR_DEDUPE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _looks_like_plan(text: str | None) -> bool:
     """A short statement of intent (or a dangling colon) rather than a final answer.
 
@@ -716,6 +772,35 @@ def _max_sessions() -> int:
     except ValueError:
         value = 16
     return max(1, min(value, 128))
+
+
+def _max_turn_tool_calls() -> int:
+    """Turn cap for queued tool calls; HERMES_CURSOR_MAX_TURN_TOOL_CALLS overrides it.
+
+    Unset or blank gives the default. A malformed or non-positive value also gives the
+    default, with a warning (the same rule as ``_run_timeout_seconds``). A valid value is
+    clamped into ``[1, _MAX_MAX_TURN_TOOL_CALLS]``, with a warning when the clamp changes
+    it. The cap cannot be switched off: it exists to stop a runaway turn.
+    """
+    raw = os.environ.get("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", "").strip()
+    if not raw:
+        return _DEFAULT_MAX_TURN_TOOL_CALLS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("cursor: ignoring malformed HERMES_CURSOR_MAX_TURN_TOOL_CALLS=%r", raw)
+        return _DEFAULT_MAX_TURN_TOOL_CALLS
+    if value <= 0:
+        logger.warning("cursor: ignoring non-positive HERMES_CURSOR_MAX_TURN_TOOL_CALLS=%r", raw)
+        return _DEFAULT_MAX_TURN_TOOL_CALLS
+    clamped = min(value, _MAX_MAX_TURN_TOOL_CALLS)
+    if clamped != value:
+        logger.warning(
+            "cursor: clamping HERMES_CURSOR_MAX_TURN_TOOL_CALLS=%r to %d",
+            raw,
+            clamped,
+        )
+    return clamped
 
 
 def _run_timeout_seconds() -> float:
@@ -1269,6 +1354,13 @@ class CursorSDKClient:
         """
         parser = _ToolBlockStream(allowed_names)
         event_ids: set[str] = set()
+        if holder is not None:
+            # Publish this run's generation and its (live, mutated-in-place) reconciled id
+            # set before the pump starts, so no callback of this run can precede them. The
+            # nudge's second run gets its own generation, so an earlier run's straggler
+            # can never shadow a legitimate repeat here.
+            holder["gen"] = holder.get("gen", 0) + 1
+            holder["event_ids"] = event_ids
         cap = _run_timeout_seconds()
         started = time.monotonic()
         deadline = started + cap

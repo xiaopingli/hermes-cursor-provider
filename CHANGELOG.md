@@ -5,6 +5,7 @@
 - Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@reasoning_effort=xhigh,fast=true`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter variants get separate retained sessions. Verified live: an xhigh+fast selection runs, and an invalid value is rejected by Cursor.
 - Adds opt-in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) so chosen parameter variants appear in the model listing and pass Hermes' `/model` validation.
 - Nudges once when a reply has tools available but ends on a plan ("I'll read the file…") with no `<tool_call>`, instead of returning the announcement as the final answer. Disable with `HERMES_CURSOR_PLAN_NUDGE=0`.
+- Fixes the in-turn tool-call ack: the model now reads an explicit "accepted by Hermes … runs after this turn" instead of a bare `queued` (which it took for failure and answered by re-issuing the same calls), and each custom tool's description says Hermes runs it after the turn. A repeat of an already-accepted `(tool, arguments)` call within one run is collapsed to a duplicate ack and does not use up the turn cap. Adds two toggles: `HERMES_CURSOR_MAX_TURN_TOOL_CALLS` (default 64, was a fixed 16; clamped to 1–1024, a malformed or non-positive value falls back to 64 with a warning) and `HERMES_CURSOR_DEDUPE` (default on; `0`/`false`/`no`/`off` turns the collapse off). The limit refusal text changes to "refused: turn limit of N tool calls reached …".
 
 ## 0.3.6
 

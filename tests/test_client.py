@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import re
 import threading
@@ -1548,7 +1549,9 @@ def test_offered_tools_are_custom_tools():
     sdk = FakeCursorClient.instances[0]
     local = sdk.options[0]["local"]
     assert set(local["custom_tools"]) == {"read_file"}
-    assert local["custom_tools"]["read_file"]["description"] == "Read one file"
+    assert local["custom_tools"]["read_file"]["description"] == (
+        "Read one file" + client_module._TOOL_DESCRIPTION_SUFFIX
+    )
     assert local["custom_tools"]["read_file"]["input_schema"] == _tool()["function"]["parameters"]
     assert callable(local["custom_tools"]["read_file"]["execute"])
 
@@ -1683,7 +1686,7 @@ def test_callback_returns_tool_call_to_hermes():
     finally:
         client.close()
     sdk = FakeCursorClient.instances[0]
-    assert sdk.tool_callbacks == ["queued"]
+    assert sdk.tool_callbacks == [client_module._ACK_ACCEPTED]
     choice = response.choices[0]
     assert choice.finish_reason == "tool_calls"
     call = choice.message.tool_calls[0]
@@ -1780,7 +1783,9 @@ def test_stale_callback_name_is_dropped():
     specs = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
     tools = client_module.hermes_tools_as_custom_tools(specs, holder)
     stale = tools["read_file"]["execute"]
-    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == "queued"
+    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == (
+        client_module._ACK_ACCEPTED
+    )
     assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_stale"]
 
     # Rebind the SAME dict for the next turn, which did not offer read_file.
@@ -1800,8 +1805,8 @@ def test_stale_callback_name_is_dropped():
     assert holder["sink"] == []
 
 
-def test_turn_cap_refuses_the_seventeenth_callback():
-    """The 16-call cap is a hard stop: the 17th callback is refused, not queued."""
+def test_turn_cap_refuses_the_sixty_fifth_callback():
+    """The 64-call cap is a hard stop: the 65th callback is refused, not queued."""
     holder = {
         "sink": [],
         "allowed": {"read_file"},
@@ -1812,14 +1817,250 @@ def test_turn_cap_refuses_the_seventeenth_callback():
     execute = client_module.hermes_tools_as_custom_tools(specs, holder)["read_file"]["execute"]
     acks = [
         execute({"path": f"f{index}.txt"}, SimpleNamespace(tool_call_id=f"call_{index}"))
-        for index in range(17)
+        for index in range(65)
     ]
-    assert acks[:16] == ["queued"] * 16
-    assert acks[16] == "refused: too many tool calls in one turn; state the final answer now"
-    assert len(holder["sink"]) == 16
+    assert acks[:64] == [client_module._ACK_ACCEPTED] * 64
+    assert acks[64] == client_module._ACK_REFUSED_LIMIT.format(cap=64)
+    assert len(holder["sink"]) == 64
     assert [entry["tool_call_id"] for entry in holder["sink"]] == [
-        f"call_{index}" for index in range(16)
+        f"call_{index}" for index in range(64)
     ]
+
+
+# --- honest ack, run-scoped dedupe, configurable cap ---
+
+_ACK_ACCEPTED_TEXT = (
+    "accepted by Hermes: this tool is queued and runs after this turn; its result "
+    "arrives in the next message. Do not call it again with the same arguments."
+)
+_ACK_DUPLICATE_TEXT = (
+    "already accepted this turn \u2014 this exact call is queued once; do not repeat it. "
+    "Its result arrives in the next message."
+)
+_ACK_REFUSED_LIMIT_TEXT = (
+    "refused: turn limit of {cap} tool calls reached; the calls already accepted will "
+    "still return their results. State your final answer now."
+)
+_TOOL_DESCRIPTION_SUFFIX_TEXT = (
+    "\n\n(Hermes executes this tool after your turn; its result arrives in the next "
+    "message. Do not repeat a call you have already made this turn.)"
+)
+
+
+def _seeded(gen, ids):
+    """A holder as `_run_once` leaves it: this run's generation and its reconciled ids."""
+    return {
+        "sink": [],
+        "allowed": {"read_file"},
+        "registered": {"read_file"},
+        "active": True,
+        "gen": gen,
+        "event_ids": set(ids),
+    }
+
+
+def _plain():
+    """The four pre-existing keys only: what a hand-built holder looked like before."""
+    return {
+        "sink": [],
+        "allowed": {"read_file"},
+        "registered": {"read_file"},
+        "active": True,
+    }
+
+
+def _execute_on(holder, name="read_file"):
+    specs = [{"name": name, "description": "", "parameters": {"type": "object"}}]
+    return client_module.hermes_tools_as_custom_tools(specs, holder)[name]["execute"]
+
+
+def _ctx(call_id):
+    return SimpleNamespace(tool_call_id=call_id)
+
+
+def _entry(gen, call_id, path="a.txt", name="read_file"):
+    """A full pre-seeded sink entry: the predicate reads name, arguments, id and gen."""
+    return {"name": name, "arguments": {"path": path}, "tool_call_id": call_id, "gen": gen}
+
+
+def test_accepted_ack_is_the_honest_wording_and_appends_one_entry():
+    """Test 1: the in-turn signal says accepted/queued, not a bare 'queued'."""
+    assert client_module._ACK_ACCEPTED == _ACK_ACCEPTED_TEXT
+    holder = _plain()
+    ack = _execute_on(holder)({"path": "a.txt"}, _ctx("call_1"))
+    assert ack == client_module._ACK_ACCEPTED
+    assert ack != "queued"
+    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_1"]
+
+
+def test_identical_repeat_in_one_run_is_collapsed():
+    """Test 2: the same (name, args) twice in one run is queued once and acked as such."""
+    assert client_module._ACK_DUPLICATE == _ACK_DUPLICATE_TEXT
+    holder = _seeded(2, ["call_1"])
+    execute = _execute_on(holder)
+    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
+    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
+    assert len(holder["sink"]) == 1
+    # Guard order is active -> allowed -> call-id -> dedupe: an id-less repeat still takes
+    # the id refusal and is never answered with a positive ack.
+    idless = execute({"path": "a.txt"}, _ctx(None))
+    assert idless.startswith("refused:")
+    assert idless != client_module._ACK_DUPLICATE
+    assert len(holder["sink"]) == 1
+
+
+def test_duplicate_does_not_consume_the_cap(monkeypatch):
+    """Test 3: A, A(dup), B all pass; only a third distinct call is refused at cap 2.
+    Also pins the guard order: at the cap, a repeat still collapses (dedupe before cap)."""
+    monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", "2")
+    holder = _seeded(2, ["call_1"])
+    execute = _execute_on(holder)
+    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
+    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
+    assert execute({"path": "b.txt"}, _ctx("call_3")) == client_module._ACK_ACCEPTED
+    assert execute({"path": "c.txt"}, _ctx("call_4")) == (
+        client_module._ACK_REFUSED_LIMIT.format(cap=2)
+    )
+    # The guard order itself: with the sink already AT the cap, a repeat of a *reconciled*
+    # accepted call must still take the duplicate ack. If the cap were checked before the
+    # dedupe this would be the limit refusal, and nothing else in the suite would notice.
+    # (Only `call_1` is in this holder's event_ids, so only a repeat of `a.txt` is eligible.)
+    assert execute({"path": "a.txt"}, _ctx("call_5")) == client_module._ACK_DUPLICATE
+    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_1", "call_3"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, 64, False),
+        ("", 64, False),
+        ("   ", 64, False),
+        ("abc", 64, True),
+        ("0", 64, True),
+        ("-3", 64, True),
+        ("5", 5, False),
+        ("1", 1, False),
+        ("1024", 1024, False),
+        ("99999", 1024, True),
+    ],
+)
+def test_max_turn_tool_calls_env_semantics(monkeypatch, caplog, raw, expected, warns):
+    """Test 4: unset/blank -> default; malformed or <= 0 -> default + warning; else clamped."""
+    if raw is None:
+        monkeypatch.delenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", raw)
+    with caplog.at_level(logging.WARNING, logger=client_module.__name__):
+        value = client_module._max_turn_tool_calls()
+    assert value == expected
+    assert isinstance(value, int)
+    warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert bool(warned) is warns
+    assert client_module._DEFAULT_MAX_TURN_TOOL_CALLS == 64
+    assert client_module._MAX_MAX_TURN_TOOL_CALLS == 1024
+
+
+def test_limit_refusal_tells_the_model_what_still_happens(monkeypatch):
+    """Test 5: the refusal says the limit was reached and accepted calls still return."""
+    assert client_module._ACK_REFUSED_LIMIT == _ACK_REFUSED_LIMIT_TEXT
+    monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", "1")
+    holder = _plain()
+    execute = _execute_on(holder)
+    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
+    refusal = execute({"path": "b.txt"}, _ctx("call_2"))
+    assert "turn limit" in refusal
+    assert "still return their results" in refusal
+    assert refusal == _ACK_REFUSED_LIMIT_TEXT.format(cap=1)
+    assert len(holder["sink"]) == 1
+
+
+def test_description_suffix_is_on_every_custom_tool():
+    """Test 6: each registered tool says Hermes runs it later; None/missing -> suffix alone."""
+    assert client_module._TOOL_DESCRIPTION_SUFFIX == _TOOL_DESCRIPTION_SUFFIX_TEXT
+    specs = [
+        {"name": "alpha", "description": "Alpha tool", "parameters": {"type": "object"}},
+        {"name": "beta", "description": None, "parameters": {"type": "object"}},
+        {"name": "gamma", "parameters": {"type": "object"}},
+    ]
+    tools = client_module.hermes_tools_as_custom_tools(specs, {})
+    assert tools["alpha"]["description"] == "Alpha tool" + _TOOL_DESCRIPTION_SUFFIX_TEXT
+    assert tools["beta"]["description"] == _TOOL_DESCRIPTION_SUFFIX_TEXT
+    assert tools["gamma"]["description"] == _TOOL_DESCRIPTION_SUFFIX_TEXT
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF", " 0 "])
+def test_dedupe_kill_switch_lets_the_repeat_through(monkeypatch, value):
+    """Test 7: HERMES_CURSOR_DEDUPE off -> the repeat is accepted; on, the same fixture dedupes."""
+    control = _seeded(2, ["call_1"])
+    execute = _execute_on(control)
+    execute({"path": "a.txt"}, _ctx("call_1"))
+    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
+
+    monkeypatch.setenv("HERMES_CURSOR_DEDUPE", value)
+    holder = _seeded(2, ["call_1"])
+    execute = _execute_on(holder)
+    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
+    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
+    assert len(holder["sink"]) == 2
+
+
+def test_older_generation_entry_does_not_shadow_a_repeat():
+    """Test 8: an earlier run's entry (gen 1) never suppresses the current run's (gen 2) repeat."""
+    holder = _seeded(2, ["call_1"])
+    holder["sink"].append(_entry(1, "call_1"))
+    ack = _execute_on(holder)({"path": "a.txt"}, _ctx("call_2"))
+    assert ack == client_module._ACK_ACCEPTED
+    assert [(e["tool_call_id"], e["gen"]) for e in holder["sink"]] == [("call_1", 1), ("call_2", 2)]
+
+
+def test_unreconciled_entry_does_not_shadow_a_live_repeat():
+    """Test 9: an entry whose id is not in this run's event ids cannot suppress a live call."""
+    holder = _seeded(2, [])
+    holder["sink"].append(_entry(2, "call_1"))
+    assert _execute_on(holder)({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
+    assert len(holder["sink"]) == 2
+
+    # Positive control: the same entry, once reconciled, does suppress the repeat.
+    control = _seeded(2, ["call_1"])
+    control["sink"].append(_entry(2, "call_1"))
+    assert _execute_on(control)({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
+    assert len(control["sink"]) == 1
+
+
+def test_each_run_of_a_nudged_turn_gets_its_own_generation():
+    """Test 10: `_run_once` bumps the generation per run, so a nudged turn advances it twice."""
+    client, sdk = _sdk_client()
+    _sequenced(sdk, ["I'll read the file.", _CALL])
+    client.chat.completions.create(
+        model="grok-4.7",
+        messages=[{"role": "user", "content": "apply the fix note"}],
+        tools=[_tool()],
+        _cursor_session_scope="scope-gen-nudged",
+    )
+    nudged = next(iter(client_module._SESSIONS.values())).tool_holder
+    assert nudged["gen"] == 2
+    assert isinstance(nudged["event_ids"], set)
+
+    # Control: a turn with no nudge is one run, so a per-turn bump or a constant 2 would differ.
+    client_module._reset_session_registry()
+    _sequenced(sdk, ["All done."])
+    client.chat.completions.create(
+        model="grok-4.7",
+        messages=[{"role": "user", "content": "apply the fix note"}],
+        tools=[_tool()],
+        _cursor_session_scope="scope-gen-plain",
+    )
+    assert next(iter(client_module._SESSIONS.values())).tool_holder["gen"] == 1
+
+
+def test_holder_without_the_new_keys_survives_the_dedupe_predicate():
+    """Test 11: a hand-built holder with neither new key must not KeyError in the predicate."""
+    holder = _plain()
+    execute = _execute_on(holder)
+    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
+    # The sink is non-empty now, so this second identical call enters the predicate.
+    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
+    assert len(holder["sink"]) == 2
 
 
 def test_plan_with_zero_callbacks_is_an_error():
@@ -1847,7 +2088,7 @@ def test_stream_emits_native_tool_call_deltas():
         )
     finally:
         client.close()
-    assert sdk.tool_callbacks == ["queued"]
+    assert sdk.tool_callbacks == [client_module._ACK_ACCEPTED]
     assert _stream_text(chunks) == "hello"
     _assert_held_text_precedes_call_deltas(chunks)
     calls = _stream_calls(chunks)
