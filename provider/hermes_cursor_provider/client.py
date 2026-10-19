@@ -1777,7 +1777,7 @@ class CursorSDKClient:
                     session.last_input_tokens,
                     budget,
                 )
-            if session.agent is not None and (not extends or toolset_changed):
+            if session.agent is not None and (not extends or toolset_changed or over_budget):
                 with suppress(Exception):
                     session.agent.close()
                 session.agent = None
