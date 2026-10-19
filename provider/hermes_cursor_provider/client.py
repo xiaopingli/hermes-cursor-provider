@@ -30,6 +30,14 @@ _MAX_IMAGES = 4
 _MAX_IMAGE_BASE64_CHARS = 28_000_000
 _DEFAULT_MAX_TURN_TOOL_CALLS = 64
 _MAX_MAX_TURN_TOOL_CALLS = 1024
+# Session-thread budget. The SDK agent keeps its own accumulated thread and re-submits it
+# on every send, so a long session can submit several times the model's declared window
+# (the harness has seen a 3.9M-token input on a 500k model). When the last call's reported
+# input crosses this budget the agent is retired and a fresh one starts from the full
+# transcript. HERMES_CURSOR_SESSION_TOKEN_BUDGET overrides it, and outranks the model's own
+# ``context=`` parameter so it can always disable or retune the policy at runtime.
+_ENV_SESSION_TOKEN_BUDGET = "HERMES_CURSOR_SESSION_TOKEN_BUDGET"
+_DEFAULT_SESSION_TOKEN_FRACTION = 1.0
 _STREAM_HEARTBEAT_SECONDS = 60.0
 # Wall-clock cap for one Cursor SDK run. The SDK's send/stream/wait path has no bounded
 # wait of its own; without this a stalled run holds the Hermes turn open indefinitely.
@@ -774,6 +782,80 @@ def _max_sessions() -> int:
     return max(1, min(value, 128))
 
 
+def _parse_context_window(model: str | None) -> int | None:
+    """The declared context window carried in a model string, or None when absent.
+
+    ``context=500k`` means 500,000 — the same mapping Hermes itself uses for this variant
+    (``config.yaml`` pairs that string with ``context_window: 500000``), so the budget and
+    the declared window agree instead of differing by 2.4%. A bare number is taken as-is;
+    anything non-numeric is treated as absent. Parsing never raises: a malformed parameter
+    is a missing one, which the caller handles by leaving the policy off.
+    """
+    try:
+        _, params = _split_model(model)
+    except ValueError:
+        return None
+    for param in params:
+        if param.get("id") != "context":
+            continue
+        raw = str(param.get("value") or "").strip().lower()
+        try:
+            if raw.endswith("k"):
+                return int(float(raw[:-1]) * 1000)
+            if raw.endswith("m"):
+                return int(float(raw[:-1]) * 1_000_000)
+            return int(raw)
+        except ValueError:
+            return None
+    return None
+
+
+def _session_token_budget(model: str | None) -> int | None:
+    """The session-thread budget in tokens, or None when the policy is off.
+
+    Resolution order, deliberately env first: ``HERMES_CURSOR_SESSION_TOKEN_BUDGET`` is the
+    kill switch and outranks the model's own parameter, because the live and harness model
+    strings always carry ``context=500k`` — an env var that could be shadowed by the model
+    string could never act on the running configuration. Accepted values: a positive
+    integer (that budget); ``off`` or ``0`` (policy off); anything else is treated as unset
+    with one warning. With no env value the budget follows the model's declared window;
+    with neither, the policy is off and the caller logs that once per session.
+    """
+    raw = os.environ.get(_ENV_SESSION_TOKEN_BUDGET, "").strip()
+    if raw:
+        lowered = raw.lower()
+        if lowered in {"off", "false", "no", "none"}:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            logger.warning(
+                "cursor: ignoring malformed %s=%r (expected a token count, or off)",
+                _ENV_SESSION_TOKEN_BUDGET,
+                raw,
+            )
+        else:
+            if value <= 0:
+                return None
+            return value
+    window = _parse_context_window(model)
+    if window is None:
+        return None
+    return int(window * _DEFAULT_SESSION_TOKEN_FRACTION)
+
+
+def _should_retire_session(last_input_tokens: int, budget: int | None) -> bool:
+    """True when the last call's reported input has reached the budget.
+
+    A budget of None means the policy is off. A non-positive reported value means "unknown"
+    (no call has completed yet, or the SDK reported nothing) and never retires: a fresh
+    session must not be retired on its first turn.
+    """
+    if budget is None or last_input_tokens <= 0:
+        return False
+    return last_input_tokens >= budget
+
+
 def _max_turn_tool_calls() -> int:
     """Turn cap for queued tool calls; HERMES_CURSOR_MAX_TURN_TOOL_CALLS overrides it.
 
@@ -882,6 +964,13 @@ class _Session:
     history: list[dict[str, Any]] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
     tool_holder: dict[str, Any] = field(default_factory=_new_tool_holder)
+    # Reported input tokens of the last completed call in this session; 0 means unknown.
+    # Written on the success path only (a failed run has no usage to read), and read at the
+    # top of the session branch to decide whether the SDK thread has outgrown its budget.
+    last_input_tokens: int = 0
+    # One log line per session when the policy is off for want of any window, so the
+    # unmitigated configuration is visible without spamming every turn.
+    budget_warned: bool = False
 
 
 _REGISTRY_LOCK = threading.RLock()
@@ -1525,7 +1614,27 @@ class CursorSDKClient:
             toolset_changed = (
                 session.agent is not None and holder["allowed"] != holder["registered"]
             )
-            if session.agent is not None and (not extends or toolset_changed):
+            # Session-thread budget: the SDK agent re-submits its whole thread each send, so
+            # retire it once the last call's reported input reached the model's declared
+            # window (or the env override). Retiring re-sends the full transcript, which is
+            # what keeps context while bounding what Cursor is asked to re-read.
+            budget = _session_token_budget(model)
+            over_budget = _should_retire_session(session.last_input_tokens, budget)
+            if budget is None and not session.budget_warned:
+                session.budget_warned = True
+                logger.info(
+                    "cursor: session token budget off for this session — no %s and no "
+                    "context= parameter on %r, so the SDK thread is unbounded",
+                    _ENV_SESSION_TOKEN_BUDGET,
+                    model,
+                )
+            if over_budget:
+                logger.info(
+                    "cursor: retiring session agent at %d reported input tokens (budget %s)",
+                    session.last_input_tokens,
+                    budget,
+                )
+            if session.agent is not None and (not extends or toolset_changed or over_budget):
                 with suppress(Exception):
                     session.agent.close()
                 session.agent = None
@@ -1557,6 +1666,10 @@ class CursorSDKClient:
                 holder=holder,
             )
             session.history = incoming + [_assistant_history(content, calls)]
+            # Record what this call actually submitted, so the next turn can decide whether
+            # the SDK thread has outgrown its budget. Success path only: when _run_agent
+            # raises, `result` is unbound and CursorSDKRunError carries no usage.
+            session.last_input_tokens = int(_usage(result).prompt_tokens or 0)
             return result, calls, content
         except BaseException as exc:
             if isinstance(exc, CursorSDKRunError):
