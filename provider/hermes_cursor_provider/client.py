@@ -359,6 +359,23 @@ def extract_tool_calls(text: str, allowed_names: set[str]) -> tuple[list[Any], s
     return parser.calls, parser.text
 
 
+def _log_session_id() -> str:
+    """The current Hermes session id, so this plugin's lines correlate with the core's.
+
+    ``get_session_env`` is the supported accessor: the ContextVar wins under concurrency and
+    falls back to ``os.environ`` for CLI/cron. Degrading to ``-`` is deliberate — a missing id
+    must never break a run, and this is called from a logging path.
+    """
+    try:
+        from gateway.session_context import get_session_env
+
+        value = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:  # noqa: BLE001 - the id is diagnostic only
+        value = os.environ.get("HERMES_SESSION_ID", "")
+    text = str(value or "").strip()
+    return text or "-"
+
+
 def _usage(result: Any) -> Any:
     usage = getattr(result, "usage", None)
     prompt = int(getattr(usage, "input_tokens", 0) or 0)
@@ -800,6 +817,26 @@ def _max_sessions() -> int:
     return max(1, min(value, 128))
 
 
+def _parse_token_count(raw: str) -> int | None:
+    """A token count written as ``250000``, ``250k`` or ``2m``; None when unreadable.
+
+    The single mapping both the model's ``context=`` parameter and the env override use, so
+    ``250k`` means 250,000 in both places (Hermes's own mapping) instead of 256,000 or a
+    silently different value. Never raises: an unreadable count is a missing one.
+    """
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    try:
+        if text.endswith("k"):
+            return int(float(text[:-1]) * 1000)
+        if text.endswith("m"):
+            return int(float(text[:-1]) * 1_000_000)
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _parse_context_window(model: str | None) -> int | None:
     """The declared context window carried in a model string, or None when absent.
 
@@ -816,15 +853,7 @@ def _parse_context_window(model: str | None) -> int | None:
     for param in params:
         if param.get("id") != "context":
             continue
-        raw = str(param.get("value") or "").strip().lower()
-        try:
-            if raw.endswith("k"):
-                return int(float(raw[:-1]) * 1000)
-            if raw.endswith("m"):
-                return int(float(raw[:-1]) * 1_000_000)
-            return int(raw)
-        except ValueError:
-            return None
+        return _parse_token_count(str(param.get("value") or ""))
     return None
 
 
@@ -844,18 +873,18 @@ def _session_token_budget(model: str | None) -> int | None:
         lowered = raw.lower()
         if lowered in {"off", "false", "no", "none"}:
             return None
-        try:
-            value = int(raw)
-        except ValueError:
-            logger.warning(
-                "cursor: ignoring malformed %s=%r (expected a token count, or off)",
-                _ENV_SESSION_TOKEN_BUDGET,
-                raw,
-            )
-        else:
-            if value <= 0:
+        # Accept the same k/m notation the model's own context= parameter uses, so an override
+        # can be written the way the value reads beside it (250k, not 250000).
+        scaled = _parse_token_count(lowered)
+        if scaled is not None:
+            if scaled <= 0:
                 return None
-            return value
+            return scaled
+        logger.warning(
+            "cursor: ignoring malformed %s=%r (expected a token count such as 250000 or 250k, or off)",
+            _ENV_SESSION_TOKEN_BUDGET,
+            raw,
+        )
     window = _parse_context_window(model)
     if window is None:
         return None
@@ -1387,6 +1416,7 @@ class CursorSDKClient:
         allowed_names: set[str],
         control: _StreamControl | None = None,
         holder: dict[str, Any] | None = None,
+        mode: str = "ephemeral",
     ) -> Any:
         """Run one turn; if it ends on a plan with tools available, nudge once for the call.
 
@@ -1400,6 +1430,7 @@ class CursorSDKClient:
             allowed_names=allowed_names,
             control=control,
             holder=holder,
+            mode=mode,
         )
         if calls or not allowed_names or not _plan_nudge_enabled() or not _looks_like_plan(content):
             return result, calls, content
@@ -1413,6 +1444,7 @@ class CursorSDKClient:
             allowed_names=allowed_names,
             control=control,
             holder=holder,
+            mode=mode,
         )
         if calls:
             # The turn continues with a tool call, but a FINAL: prefix the nudged reply
@@ -1447,6 +1479,7 @@ class CursorSDKClient:
         allowed_names: set[str],
         control: _StreamControl | None = None,
         holder: dict[str, Any] | None = None,
+        mode: str = "ephemeral",
     ) -> Any:
         """Run one agent turn, yielding ('text'|'call', value) events as they stream.
 
@@ -1474,6 +1507,15 @@ class CursorSDKClient:
         pump = _RunPump(self, agent, {"text": prompt, "images": images}, control)
         pump.start()
         streamed = ""
+        # Stream-health counters. Timestamps are taken where the caller consumes the queue,
+        # which is where a stall is actually felt; nothing here sits on the token path and no
+        # observer thread is added. One line is emitted at exit, in the finally below.
+        first_at: float | None = None
+        last_at: float | None = None
+        max_gap = 0.0
+        events = 0
+        close = "unknown"
+        finished: Any = None
         try:
             while True:
                 try:
@@ -1481,7 +1523,17 @@ class CursorSDKClient:
                         timeout=max(deadline - time.monotonic(), 0.0)
                     )
                 except queue.Empty:
+                    close = "timeout"
                     raise _run_timeout_error(cap, time.monotonic() - started) from None
+                now = time.monotonic()
+                events += 1
+                if first_at is None:
+                    first_at = now
+                elif last_at is not None:
+                    gap = now - last_at
+                    if gap > max_gap:
+                        max_gap = gap
+                last_at = now
                 if kind == _RunPump.EVENT:
                     # A heartbeat point for the streaming builder, which is chunk-silent
                     # while it holds a reply (thinking events included).
@@ -1493,23 +1545,91 @@ class CursorSDKClient:
                     yield from parser.feed(value)
                 elif kind == _RunPump.DONE:
                     result, failure = value
+                    finished = result
+                    close = "done"
                     break
                 else:  # _RunPump.ERROR: the SDK work raised on the worker thread
+                    close = "sdk_error"
                     raise value
             status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
             status = str(status_value or "").upper()
             if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                close = f"status_{status.lower() or 'error'}"
                 raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
             tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
             if tail:
                 yield from parser.feed(tail)
             yield from parser.flush()
+            close = "done"
             return result, _merged_calls(holder, event_ids, parser.calls), parser.text
+        except GeneratorExit:
+            # The consumer stopped reading (a cancelled turn): a close reason of its own, not
+            # an error. BaseException handling below still cancels the worker.
+            close = "consumer_closed"
+            raise
         except BaseException:
+            if close == "unknown":
+                close = "error"
+            raise
+        finally:
             # Cancelling is how the worker is stopped: it may be blocked inside the SDK
             # with no other way to observe that nobody is reading its queue any more.
             pump.cancel()
-            raise
+            self._log_stream_health(
+                mode=mode,
+                close=close,
+                started=started,
+                first_at=first_at,
+                max_gap=max_gap,
+                events=events,
+                prompt=prompt,
+                result=finished,
+            )
+
+    def _log_stream_health(
+        self,
+        *,
+        mode: str,
+        close: str,
+        started: float,
+        first_at: float | None,
+        max_gap: float,
+        events: int,
+        prompt: str,
+        result: Any,
+    ) -> None:
+        """One structured line per SDK run: the numbers an unattributed stall needs.
+
+        Deliberately a single line emitted at exit. The counters are plain floats updated in the
+        consume loop, so nothing sits on the token path and no observer thread is added; the
+        whole body is guarded because a logging failure must never change a run's outcome.
+
+        ``ttfe=-1.00s`` means the run produced no event at all before it closed — the shape that
+        a silent hang leaves behind. ``in_tokens=0`` means the run never returned a result, so
+        the provider reported no usage (a stall or a timeout), not that it used no tokens.
+        """
+        try:
+            duration = time.monotonic() - started
+            ttfe = (first_at - started) if first_at is not None else -1.0
+            tokens = 0
+            if result is not None:
+                with suppress(Exception):
+                    tokens = int(_usage(result).prompt_tokens or 0)
+            logger.info(
+                "cursor: stream health mode=%s close=%s events=%d ttfe=%.2fs gap=%.2fs "
+                "dur=%.2fs in_tokens=%d prompt_chars=%d session=%s",
+                mode,
+                close,
+                events,
+                ttfe,
+                max_gap,
+                duration,
+                tokens,
+                len(prompt),
+                _log_session_id(),
+            )
+        except Exception:  # noqa: BLE001 - diagnostics must never break a turn
+            return
 
     def _run_ephemeral(
         self,
@@ -1682,6 +1802,7 @@ class CursorSDKClient:
                 allowed_names=allowed_names,
                 control=control,
                 holder=holder,
+                mode="persistent",
             )
             session.history = incoming + [_assistant_history(content, calls)]
             # Record what this call actually submitted, so the next turn can decide whether

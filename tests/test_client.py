@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import logging
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from hermes_cursor_provider import client as client_module
 from hermes_cursor_provider.client import (
     CURSOR_API_URL,
     CursorSDKClient,
+    CursorSDKRunError,
     extract_images,
     extract_tool_calls,
     list_cursor_models,
@@ -2637,3 +2639,153 @@ def test_session_with_no_reported_tokens_never_retires(monkeypatch):
     )
     client.close()
     assert len(sdk.agents) == 1, "unknown reported tokens must not retire the agent"
+
+
+# --- P2: stream health is observable ------------------------------------------------
+# One structured line per SDK run, carrying the numbers an unattributed stall needs:
+# mode, close reason, event count, time-to-first-event, largest inter-event gap,
+# duration, reported input tokens, prompt size, and the session id. The session id
+# matters because the core's own close lines carry none.
+
+
+def _stream_health_lines(caplog):
+    return [r.getMessage() for r in caplog.records if "cursor: stream health" in r.getMessage()]
+
+
+def _field(line, name):
+    match = re.search(rf"\b{name}=([^\s]+)", line)
+    return match.group(1) if match else None
+
+
+def test_stream_health_records_a_successful_ephemeral_run(caplog):
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done text"
+    sdk.result.usage = _usage_of(4321)
+    client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    lines = _stream_health_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert _field(line, "mode") == "ephemeral"
+    assert _field(line, "close") == "done"
+    assert int(_field(line, "events")) > 0
+    assert float(_field(line, "ttfe").rstrip("s")) >= 0.0
+    assert _field(line, "in_tokens") == "4321"
+    assert int(_field(line, "prompt_chars")) > 0
+    assert _field(line, "session")  # "-" when no session is bound, never absent
+
+
+def test_stream_health_labels_the_persistent_path(caplog):
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.usage = _usage_of(10)
+    client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "hi"}],
+        _cursor_session_scope="scope-health",
+    )
+    client.close()
+    lines = _stream_health_lines(caplog)
+    assert len(lines) == 1, lines
+    assert _field(lines[0], "mode") == "persistent"
+
+
+def test_stream_health_reports_an_sdk_error(caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+
+    def boom(self):
+        raise CursorSDKRunError("the worker died")
+
+    monkeypatch.setattr(client_module._RunPump, "_collect", boom)
+    client = CursorSDKClient(api_key="crsr_test")
+    client._sdk_client()
+    with pytest.raises(CursorSDKRunError):
+        client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    lines = _stream_health_lines(caplog)
+    assert len(lines) == 1, lines
+    assert _field(lines[0], "close") == "sdk_error"
+    # No result => the provider reported no usage; 0 must not be read as "used nothing".
+    assert _field(lines[0], "in_tokens") == "0"
+
+
+def test_stream_health_reports_a_timeout_with_no_events(caplog, monkeypatch):
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+
+    def hang(self):
+        time.sleep(2.0)
+        return None, ""
+
+    monkeypatch.setattr(client_module._RunPump, "_collect", hang)
+    monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 0.05)
+    client = CursorSDKClient(api_key="crsr_test")
+    client._sdk_client()
+    with pytest.raises(CursorSDKRunError):
+        client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    lines = _stream_health_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert _field(line, "close") == "timeout"
+    assert _field(line, "events") == "0"
+    assert _field(line, "ttfe") == "-1.00s"      # sentinel: the run produced nothing at all
+    assert _field(line, "in_tokens") == "0"
+
+
+def test_stream_health_reports_a_provider_status(caplog):
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    sdk.result.status = "CANCELLED"
+    sdk.result.usage = _usage_of(7)
+    with pytest.raises(CursorSDKRunError):
+        client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    lines = _stream_health_lines(caplog)
+    assert len(lines) == 1, lines
+    assert _field(lines[0], "close") == "status_cancelled"
+
+
+def test_log_session_id_reads_the_env_fallback(monkeypatch):
+    def unavailable(name, default=""):
+        raise ImportError("no gateway in this process")
+
+    monkeypatch.setitem(sys.modules, "gateway.session_context", None)
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260101_000000_abcdef")
+    assert client_module._log_session_id() == "20260101_000000_abcdef"
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    assert client_module._log_session_id() == "-"
+
+
+def test_logging_failure_never_breaks_the_run(caplog, monkeypatch):
+    """Diagnostics must not be able to fail a turn: a raising logger leaves the result intact."""
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("log sink is gone")
+
+    monkeypatch.setattr(client_module.logger, "info", explode)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "still works"
+    sdk.result.usage = _usage_of(5)
+    completion = client.chat.completions.create(
+        model="auto", messages=[{"role": "user", "content": "hi"}]
+    )
+    client.close()
+    assert completion.choices[0].message.content == "still works"
+
+
+def test_env_budget_accepts_the_same_k_and_m_notation_as_the_model_parameter(monkeypatch):
+    """The override sits beside `context=500k`, so it must read the same way."""
+    assert client_module._session_token_budget("grok-4.7") == None  # noqa: E711 - no env, no param
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "250k")
+    assert client_module._session_token_budget("grok-4.7") == 250_000
+    assert client_module._session_token_budget("grok-4.7@context=500k") == 250_000
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "2M")
+    assert client_module._session_token_budget("grok-4.7@context=500k") == 2_000_000
+    monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "250")
+    assert client_module._session_token_budget("grok-4.7") == 250
