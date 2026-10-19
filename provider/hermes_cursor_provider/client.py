@@ -1566,15 +1566,20 @@ class CursorSDKClient:
             # The consumer stopped reading (a cancelled turn): a close reason of its own, not
             # an error. BaseException handling below still cancels the worker.
             close = "consumer_closed"
+            pump.cancel()
             raise
         except BaseException:
             if close == "unknown":
                 close = "error"
-            raise
-        finally:
             # Cancelling is how the worker is stopped: it may be blocked inside the SDK
             # with no other way to observe that nobody is reading its queue any more.
             pump.cancel()
+            raise
+        finally:
+            # Logging only. Cancel deliberately stays on the abnormal paths: after a normal
+            # completion ``_settle`` has already released the run, and the pump's own handle
+            # still points at it, so cancelling here would cancel a finished run — exactly
+            # what ``_settle``'s contract exists to prevent.
             self._log_stream_health(
                 mode=mode,
                 close=close,

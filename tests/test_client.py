@@ -2789,3 +2789,58 @@ def test_env_budget_accepts_the_same_k_and_m_notation_as_the_model_parameter(mon
     assert client_module._session_token_budget("grok-4.7@context=500k") == 2_000_000
     monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "250")
     assert client_module._session_token_budget("grok-4.7") == 250
+
+
+def test_a_completed_run_is_not_cancelled(caplog, monkeypatch):
+    """``_settle`` releases a finished run so nobody cancels it; the exit path must respect that.
+
+    The pump keeps its own handle on the run after ``_settle`` clears the client's, so a
+    cancel placed on the normal exit path would cancel an already-finished run.
+    """
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    runs = []
+    original_send = FakeAgent.send
+
+    def recording_send(self, message):
+        run = original_send(self, message)
+        runs.append(run)
+        return run
+
+    monkeypatch.setattr(FakeAgent, "send", recording_send)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "hello"
+    sdk.result.usage = _usage_of(9)
+    client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    assert runs, "no run was created"
+    assert not any(run.cancelled for run in runs), "a completed run was cancelled"
+    assert _field(_stream_health_lines(caplog)[0], "close") == "done"
+
+
+def test_an_abandoned_run_is_still_cancelled(caplog, monkeypatch):
+    """The cancel must stay on the abnormal paths — the worker is blocked inside the SDK."""
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    runs = []
+    original_send = FakeAgent.send
+
+    def recording_send(self, message):
+        run = original_send(self, message)
+        runs.append(run)
+        return run
+
+    def hang(self):
+        time.sleep(2.0)
+        return None, ""
+
+    monkeypatch.setattr(FakeAgent, "send", recording_send)
+    monkeypatch.setattr(client_module._RunPump, "_collect", hang)
+    monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 0.05)
+    client = CursorSDKClient(api_key="crsr_test")
+    client._sdk_client()
+    with pytest.raises(CursorSDKRunError):
+        client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    # The run object is created by the pump's own _collect, so it is not in `runs`; assert the
+    # close reason instead, which is what the timeout path is responsible for.
+    assert _field(_stream_health_lines(caplog)[0], "close") == "timeout"
