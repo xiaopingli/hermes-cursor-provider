@@ -21,3 +21,17 @@ jobs:
       - run: git clone --depth 1 https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
       - run: pip install -e "$RUNNER_TEMP/hermes-agent"
       - run: PYTHONPATH="$RUNNER_TEMP/hermes-agent" python scripts/current_main_probe.py
+
+  # The suite passing only proves the tests are green, not that they are sensitive to the
+  # behaviours we rely on. Two real defects in this plugin's history (a missing token
+  # write-back, and a guard that ignored its own retire decision) left every test green.
+  # This job breaks one guarantee at a time and requires the suite to notice.
+  mutations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - run: pip install 'cursor-sdk>=1.0.32,<2' pytest
+      - run: python scripts/mutation_check.py

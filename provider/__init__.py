@@ -11,6 +11,27 @@ from .hermes_cursor_provider.client import CURSOR_API_URL
 _SEED_MODELS = ("auto", "composer-2.5")
 
 
+def _cursor_error_verdict(
+    error: Any,
+    *,
+    status_code: int | None = None,
+    error_code: str = "",
+    message: str = "",
+    body: dict | None = None,
+    model: str = "",
+) -> dict[str, Any] | None:
+    """Terminal verdict for the plugin's fail-closed plan-only raise, and nothing else.
+
+    The profile hook runs for EVERY Cursor failure before the status and message paths,
+    so an unscoped dict would make a 429 usage limit non-retryable and non-fallback —
+    disabling credential rotation and provider fallback for all of them. Decline unless
+    the structured code proves this is our own raise.
+    """
+    if str(error_code or "").strip().lower() != "cursor_plan_only":
+        return None
+    return {"reason": "format_error", "retryable": False, "should_fallback": False}
+
+
 class CursorProfile(ProviderProfile):
     def create_client(self, **kwargs: Any):
         from .hermes_cursor_provider.client import CursorSDKClient
@@ -67,5 +88,8 @@ profile = CursorProfile(
     },
     default_aux_model="auto",
     unsupported_response_formats=("json_schema", "json_object"),
+    # Constructor kwarg, never a method: the dataclass field default would shadow a
+    # same-named method in the generated __init__.
+    classify_api_error=_cursor_error_verdict,
 )
 register_provider(profile)
