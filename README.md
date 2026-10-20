@@ -13,7 +13,7 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Disables Cursor built-in tools and MCP servers, gives each SDK agent a private working directory, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools are not used because they would execute outside Hermes' approval path.
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and offers Hermes' tools to Cursor as native custom tools. Those callbacks never execute a tool: each queues the call and acks it, and Hermes runs it after the turn through its normal approval loop, so tool execution never escapes Hermes' approval path. The older `<tool_call>` text protocol is retained only for the path where no tool schemas are supplied; whenever specs are present — every production call — native custom tools are the transport.
 
 ## Install
 
@@ -22,6 +22,14 @@ hermes plugins install 'https://github.com/anpicasso/hermes-cursor-provider.git#
 hermes auth add cursor
 hermes model
 ```
+
+> **This fork.** `xiaopingli/hermes-cursor-provider` is a public fork carrying work not yet in the
+> upstream plugin: native custom tools with the queue/ack contract, the bounded session thread, and
+> per-run stream-health logging. Install the fork instead of the stock plugin by swapping the URL:
+>
+> ```bash
+> hermes plugins install 'https://github.com/xiaopingli/hermes-cursor-provider.git#provider' --enable
+> ```
 
 Create a **user API key** at <https://cursor.com/dashboard/api>. User and service-account API keys are supported by Cursor's SDK; Team Admin keys are not inference credentials.
 
@@ -61,6 +69,8 @@ Two toggles shape how queued Hermes tool calls are handled within one turn (set 
 
 - `HERMES_CURSOR_MAX_TURN_TOOL_CALLS` — the most tool calls one turn may queue. Default `64`; values are clamped to `1`–`1024`, and a malformed or non-positive value falls back to `64` with a warning. The cap cannot be switched off.
 - `HERMES_CURSOR_DEDUPE` — default on. A repeat of an already-accepted call (same tool, same arguments) within one run is answered with a duplicate ack and not queued again, and does not count against the cap. Set `0`, `false`, `no` or `off` to queue every repeat.
+
+The SDK-side conversation thread is bounded separately. The agent re-submits its whole accumulated thread on every send, so a long session can ask Cursor to re-read several times the model's declared window. The agent is retired once the last call's reported input reaches the session budget, and a fresh agent receives the full transcript. The budget follows the model string's own `context=` parameter (`500k` → 500,000); `HERMES_CURSOR_SESSION_TOKEN_BUDGET` overrides it and outranks the parameter (both `250k` and `250000` are accepted, `off`/`0` disables the policy), and with neither present the policy is off and logs once per session.
 
 A running gateway may retain the previous provider import. After install or upgrade, restart it from an external shell:
 
