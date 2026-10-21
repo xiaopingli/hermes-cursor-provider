@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Version is now `0.5.0`, leaving upstream's `0.4.0` to mean upstream's code. Both trees carried `0.4.0` while containing different providers — ours has native `custom_tools`, the bounded run path with `HERMES_CURSOR_RUN_TIMEOUT_SECONDS`, per-run stream health, and the peak per-turn usage anchor — so `/model`, `hermes plugins doctor` and log lines could not say which one was running. The catalog pins `0.4.0` to `anpicasso/hermes-cursor-provider`; a local build must not share that string. No code change.
+
 - Reports the **largest per-turn** usage of the run as `usage.prompt_tokens` instead of the SDK's run-wide sum. Cursor's Python guide defines `run.usage` / `result.usage` as "summed across every turn that reported usage", while the `usage` stream event carries one turn's own numbers; Hermes reads `usage.prompt_tokens` as the size of the request it just sent, so that figure anchors compression and feeds the session budget. A run that summed 598,980 across two turns for a ~241,305-token prompt made Hermes judge a 33-message session as 609,255 tokens against a 500,000 window and fail every subsequent turn closed as "too large to compress further" — no compression pass could help, because the local transcript held only ~16k tokens. The same number had retired a healthy SDK thread early.
 
 - Adds `run_in_tokens` to the stream-health line: the SDK's run-wide usage sum, beside `in_tokens` (the peak per-turn prompt Hermes anchors on). The two agree on a single-turn run and diverge exactly when a run reported several turns, so a regression back to reporting the sum is visible in one log line instead of a 600k-token mystery.

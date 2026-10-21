@@ -1,6 +1,6 @@
 name: cursor-provider
 kind: model-provider
-version: 0.4.0
+version: 0.5.0
 requires_hermes: ">=0.21.4"
 description: Cursor subscription provider using Cursor's official Python SDK.
 author: anpicasso
