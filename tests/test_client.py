@@ -2556,7 +2556,7 @@ def _multi_turn_run(sdk, *, last_turn_tokens, run_total_tokens, text="done"):
     return agent
 
 
-def test_reported_prompt_tokens_is_the_last_turn_not_the_run_total():
+def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
     """Hermes reads ``usage.prompt_tokens`` as the size of the request it just sent.
 
     It anchors compression and the per-session budget on that number, so a provider
@@ -2577,7 +2577,7 @@ def test_reported_prompt_tokens_is_the_last_turn_not_the_run_total():
     )
 
 
-def test_session_budget_records_the_last_turn_not_the_run_total():
+def test_session_budget_records_one_turn_not_the_run_total():
     """The budget compares against one thread size; a run sum retires a healthy session."""
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
@@ -2592,6 +2592,184 @@ def test_session_budget_records_the_last_turn_not_the_run_total():
     client.close()
     assert len(sessions) == 1
     assert sessions[0].last_input_tokens == 241_305
+
+
+def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
+    """A run that reports several turns must keep the peak, not whatever arrived last.
+
+    Synthetic sequence, motivated by live measurement: Cursor's per-turn ``input_tokens``
+    is not a stable thread size. Two calls on one growing thread reported 14,191 then
+    8,686, so the ordering of a run's turns cannot be assumed to end at its maximum. The
+    anchor takes the largest turn of the run for that reason.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=_usage_of(13_778)),
+            SimpleNamespace(type="usage", usage=_usage_of(8_217)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(21_995),
+    )
+    completion = _ask(client, _cursor_session_scope="scope-peak-usage")
+    client.close()
+    assert completion.usage.prompt_tokens == 13_778, (
+        "a smaller later turn overwrote the peak prompt reading"
+    )
+
+
+def _scripted_client(sdk, script, *, text="done", usage=None):
+    """Point every agent this client creates at one scripted run."""
+    outcome = FakeResult(
+        result=text,
+        model=sdk.result.model,
+        usage=usage if usage is not None else sdk.result.usage,
+    )
+
+    def send(message):
+        return ScriptedRun(outcome, list(script))
+
+    agent = FakeAgent(sdk)
+    agent.send = send
+    sdk.create_agent = lambda options: agent
+    return agent
+
+
+def _ask(client, **kwargs):
+    return client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "hi"}],
+        **kwargs,
+    )
+
+
+def test_no_usage_event_falls_back_to_the_run_result():
+    """A runtime that emits no per-turn event must keep reporting its result usage."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [_assistant_event("done")],
+        usage=_usage_of(1234),
+    )
+    completion = _ask(client, _cursor_session_scope="scope-no-usage-event")
+    client.close()
+    assert completion.usage.prompt_tokens == 1234
+
+
+def test_usage_event_without_a_value_is_ignored():
+    """A malformed/empty event must not blank the last good reading."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=None),
+            SimpleNamespace(type="usage", usage=_usage_of(500)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(9999),
+    )
+    completion = _ask(client, _cursor_session_scope="scope-null-usage")
+    client.close()
+    assert completion.usage.prompt_tokens == 500
+
+
+def test_streaming_path_reports_the_last_turn_usage():
+    """The streaming builder hands back the same swapped result, so its final chunk agrees."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=_usage_of(120_000)),
+            SimpleNamespace(type="usage", usage=_usage_of(180_000)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(300_000),
+    )
+    chunks = list(_ask(client, stream=True, _cursor_session_scope="scope-stream-usage"))
+    client.close()
+    final = [chunk for chunk in chunks if getattr(chunk, "usage", None)]
+    assert final, "no usage-bearing chunk was emitted"
+    assert final[-1].usage.prompt_tokens == 180_000
+
+
+def test_ephemeral_path_reports_the_last_turn_usage():
+    """No session scope takes the one-shot path; it shares the same run plumbing."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=_usage_of(70_000)),
+            SimpleNamespace(type="usage", usage=_usage_of(90_000)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(160_000),
+    )
+    completion = _ask(client)
+    client.close()
+    assert completion.usage.prompt_tokens == 90_000
+
+
+def test_result_that_cannot_be_swapped_keeps_its_own_usage():
+    """``replace()`` only works on dataclasses; a result that refuses it must not fail the turn."""
+
+    class Opaque:
+        def __init__(self, usage):
+            self.result = "done"
+            self.usage = usage
+            self.model = None
+            self.status = "FINISHED"
+
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    outcome = Opaque(_usage_of(4242))
+    agent = FakeAgent(sdk)
+    agent.send = lambda message: ScriptedRun(
+        outcome,
+        [SimpleNamespace(type="usage", usage=_usage_of(77)), _assistant_event("done")],
+    )
+    sdk.create_agent = lambda options: agent
+    completion = _ask(client, _cursor_session_scope="scope-opaque")
+    client.close()
+    assert completion.usage.prompt_tokens == 4242, "the un-swappable result lost its usage"
+
+
+def test_nudged_second_run_supplies_the_reported_usage():
+    """After a plan-only nudge the answer is run 2, so its usage is the one to report."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    plan = "I'll read the file first."
+    runs = [
+        ScriptedRun(
+            FakeResult(result=plan, model=sdk.result.model, usage=_usage_of(100)),
+            [SimpleNamespace(type="usage", usage=_usage_of(100)), _assistant_event(plan)],
+        ),
+        ScriptedRun(
+            FakeResult(result="FINAL: done", model=sdk.result.model, usage=_usage_of(700)),
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(700)),
+                _assistant_event("FINAL: done"),
+            ],
+        ),
+    ]
+    agent = FakeAgent(sdk)
+    agent.send = lambda message: runs.pop(0)
+    sdk.create_agent = lambda options: agent
+    completion = _ask(client, tools=[_tool()], _cursor_session_scope="scope-nudge-usage")
+    client.close()
+    assert completion.usage.prompt_tokens == 700
 
 
 def test_session_retires_agent_when_reported_tokens_reach_the_budget(monkeypatch):

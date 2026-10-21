@@ -394,8 +394,16 @@ def _usage(result: Any) -> Any:
     )
 
 
-def _with_last_turn_usage(result: Any, turn_usage: Any) -> Any:
-    """Report the LAST turn's usage on the result instead of the SDK's run-wide sum.
+def _prompt_size(usage: Any) -> int:
+    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
+    try:
+        return int(getattr(usage, "input_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _with_peak_turn_usage(result: Any, turn_usage: Any) -> Any:
+    """Report the run's LARGEST per-turn usage instead of the SDK's run-wide sum.
 
     Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage``
     hold a ``TokenUsage`` "summed across every turn that reported usage", while the
@@ -408,6 +416,11 @@ def _with_last_turn_usage(result: Any, turn_usage: Any) -> Any:
     598,980 for a ~241,305-token prompt, which anchored the session above its 500,000
     window and failed every later turn closed as "too large to compress further" — the
     local transcript held only ~16k tokens, so no compression pass could ever help.
+
+    The PEAK, not the last: when a run reports several turns, a later turn can carry a
+    smaller prompt than an earlier one, so "whatever arrived last" is not reliably the
+    thread's largest reading. The peak stays inside the documented contract (one turn's
+    numbers) and can never exceed a single turn, so the sum can never come back.
 
     Degrades to the result's own usage when no per-turn event was seen or the result
     refuses the swap; a missing number must never fail a run.
@@ -1176,9 +1189,9 @@ class _RunPump:
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.run: Any = None
         self.abandoned = False
-        # The LAST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
-        # run-wide sum, so it can never stand in for one prompt (see _with_last_turn_usage).
-        self.last_turn_usage: Any = None
+        # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
+        # run-wide sum, so it can never stand in for one prompt (see _with_peak_turn_usage).
+        self.peak_turn_usage: Any = None
         self._thread = threading.Thread(
             target=self._work, name="cursor-sdk-run", daemon=True
         )
@@ -1241,11 +1254,14 @@ class _RunPump:
                         failure = str(getattr(event, "message", "") or status)
                 elif kind == "usage":
                     # One event per turn that reported usage, carrying THAT turn's numbers
-                    # (Cursor Python guide, "Token usage"). The last one is the closest
-                    # stand-in for the prompt Hermes actually asked for.
+                    # (Cursor Python guide, "Token usage"). Keep the LARGEST: a run that
+                    # reports several turns need not finish with its biggest prompt, and
+                    # the thread's peak is the conservative reading for a compression anchor.
                     turn_usage = getattr(event, "usage", None)
-                    if turn_usage is not None:
-                        self.last_turn_usage = turn_usage
+                    if turn_usage is not None and _prompt_size(turn_usage) > _prompt_size(
+                        self.peak_turn_usage
+                    ):
+                        self.peak_turn_usage = turn_usage
         else:
             iter_text = getattr(run, "iter_text", None)
             if callable(iter_text):
@@ -1582,8 +1598,8 @@ class CursorSDKClient:
                     yield from parser.feed(value)
                 elif kind == _RunPump.DONE:
                     result, failure = value
-                    # Prefer this run's last per-turn usage over the SDK's run-wide sum.
-                    result = _with_last_turn_usage(result, pump.last_turn_usage)
+                    # Prefer this run's peak per-turn usage over the SDK's run-wide sum.
+                    result = _with_peak_turn_usage(result, pump.peak_turn_usage)
                     finished = result
                     close = "done"
                     break
