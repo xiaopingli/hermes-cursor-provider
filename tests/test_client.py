@@ -2934,6 +2934,32 @@ def test_stream_health_records_a_successful_ephemeral_run(caplog):
     assert _field(line, "session")  # "-" when no session is bound, never absent
 
 
+def test_stream_health_separates_the_peak_turn_from_the_run_sum(caplog):
+    """``in_tokens`` is the peak turn Hermes anchors on; ``run_in_tokens`` is the SDK's sum.
+
+    Logging both makes the regression that started all this visible in one line: they agree
+    on a single-turn run and diverge exactly when the run reported more than one turn.
+    """
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=_usage_of(120_000)),
+            SimpleNamespace(type="usage", usage=_usage_of(200_000)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(320_000),
+    )
+    _ask(client, _cursor_session_scope="scope-health-split")
+    client.close()
+    line = _stream_health_lines(caplog)[0]
+    assert _field(line, "in_tokens") == "200000"
+    assert _field(line, "run_in_tokens") == "320000"
+
+
 def test_stream_health_labels_the_persistent_path(caplog):
     caplog.set_level(logging.INFO, logger=client_module.logger.name)
     client = CursorSDKClient(api_key="crsr_test")
