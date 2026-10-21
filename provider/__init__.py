@@ -27,7 +27,10 @@ def _cursor_error_verdict(
     disabling credential rotation and provider fallback for all of them. Decline unless
     the structured code proves this is our own raise.
     """
-    if str(error_code or "").strip().lower() != "cursor_plan_only":
+    if str(error_code or "").strip().lower() not in {
+        "cursor_plan_only",
+        "cursor_invalid_params",
+    }:
         return None
     return {"reason": "format_error", "retryable": False, "should_fallback": False}
 
