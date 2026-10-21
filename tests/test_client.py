@@ -2530,6 +2530,70 @@ def test_session_records_reported_input_tokens_from_the_call():
     assert sessions[0].last_input_tokens == 123_456
 
 
+def _multi_turn_run(sdk, *, last_turn_tokens, run_total_tokens, text="done"):
+    """One SDK run that reported two turns, and a ``result.usage`` summed over both.
+
+    Per Cursor's Python guide (Token usage): ``run.usage`` / ``result.usage`` hold a
+    ``TokenUsage`` "summed across every turn that reported usage", while the ``usage``
+    stream event carries that turn's own numbers.
+    """
+
+    def send(message):
+        return ScriptedRun(
+            FakeResult(
+                result=text, model=sdk.result.model, usage=_usage_of(run_total_tokens)
+            ),
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(last_turn_tokens - 1_305)),
+                SimpleNamespace(type="usage", usage=_usage_of(last_turn_tokens)),
+                _assistant_event(text),
+            ],
+        )
+
+    agent = FakeAgent(sdk)
+    agent.send = send
+    sdk.create_agent = lambda options: agent
+    return agent
+
+
+def test_reported_prompt_tokens_is_the_last_turn_not_the_run_total():
+    """Hermes reads ``usage.prompt_tokens`` as the size of the request it just sent.
+
+    It anchors compression and the per-session budget on that number, so a provider
+    adapter must report one prompt — not the run total the Cursor SDK hands back.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _multi_turn_run(sdk, last_turn_tokens=241_305, run_total_tokens=598_980)
+    completion = client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first"}],
+        _cursor_session_scope="scope-turn-usage",
+    )
+    client.close()
+    assert completion.usage.prompt_tokens == 241_305, (
+        "reported the run's cumulative input instead of the last turn's prompt"
+    )
+
+
+def test_session_budget_records_the_last_turn_not_the_run_total():
+    """The budget compares against one thread size; a run sum retires a healthy session."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _multi_turn_run(sdk, last_turn_tokens=241_305, run_total_tokens=598_980)
+    client.chat.completions.create(
+        model="auto",
+        messages=[{"role": "user", "content": "first"}],
+        _cursor_session_scope="scope-turn-budget",
+    )
+    sessions = list(client_module._SESSIONS.values())
+    client.close()
+    assert len(sessions) == 1
+    assert sessions[0].last_input_tokens == 241_305
+
+
 def test_session_retires_agent_when_reported_tokens_reach_the_budget(monkeypatch):
     """At the budget the next turn must start a fresh agent (the SDK thread is reset)."""
     monkeypatch.setenv("HERMES_CURSOR_SESSION_TOKEN_BUDGET", "1000")

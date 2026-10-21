@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Reports the **last per-turn** usage as `usage.prompt_tokens` instead of the SDK's run-wide sum. Cursor's Python guide defines `run.usage` / `result.usage` as "summed across every turn that reported usage", while the `usage` stream event carries one turn's own numbers; Hermes reads `usage.prompt_tokens` as the size of the request it just sent, so that figure anchors compression and feeds the session budget. A run that summed 598,980 across two turns for a ~241,305-token prompt made Hermes judge a 33-message session as 609,255 tokens against a 500,000 window and fail every subsequent turn closed as "too large to compress further" — no compression pass could help, because the local transcript held only ~16k tokens. The same number had retired a healthy SDK thread early.
+
 ## 0.4.0 — 2026-10-20
 
 - Adds Cursor model parameter selection: `model@key=value,...` (e.g. `grok-4.7@reasoning_effort=xhigh,fast=true`) is sent to the SDK as `{id, params}`. Malformed suffixes fail before the bridge launches; parameter variants get separate retained sessions. Verified live: an xhigh+fast selection runs, and an invalid value is rejected by Cursor.
