@@ -87,6 +87,25 @@ def test_plan_only_error_is_terminal(tree_profile):
     assert verdict.should_fallback is False
 
 
+def test_invalid_parameters_error_is_terminal(tree_profile):
+    """A typo'd model parameter is permanent: retrying it burns runs, and a fallback hides it.
+
+    Live: ``reasoning_effort=bogus`` produced three failed runs and then a silent answer
+    from ``xai-oauth/grok-4.7``. The code ``cursor_invalid_params`` must stop both.
+    """
+    exc = _error(
+        tree_profile,
+        'AI Model Not Found Invalid parameters for registry model: "grok-4.7"',
+        status_code=400,
+        error_code="cursor_invalid_params",
+        body={"error": {"code": "cursor_invalid_params"}},
+    )
+    verdict = classify_api_error(exc, provider="cursor", model="grok-4.7")
+    assert verdict.reason == FailoverReason.format_error
+    assert verdict.retryable is False
+    assert verdict.should_fallback is False
+
+
 def test_usage_limit_keeps_its_own_verdict(tree_profile):
     """The hook is scoped: a 429 must keep rotating credentials / falling back."""
     exc = _error(tree_profile, "You're out of usage. Switch to Auto.")

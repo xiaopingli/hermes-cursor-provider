@@ -2594,6 +2594,21 @@ def test_session_budget_records_one_turn_not_the_run_total():
     assert sessions[0].last_input_tokens == 241_305
 
 
+def test_invalid_model_parameters_are_terminal_not_retried():
+    """A typo'd model parameter can never succeed on retry; it must not fall back either."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.status = "ERROR"
+    sdk.result.status_message = (
+        'AI Model Not Found Invalid parameters for registry model: "grok-4.7"'
+    )
+    with pytest.raises(CursorSDKRunError) as info:
+        _create(client)
+    client.close()
+    assert info.value.error_code == "cursor_invalid_params"
+    assert info.value.status_code == 400
+
+
 def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
     """A run that reports several turns must keep the peak, not whatever arrived last.
 

@@ -394,6 +394,19 @@ def _usage(result: Any) -> Any:
     )
 
 
+# Cursor failure texts that describe a CONFIGURATION error: identical parameters can never
+# succeed on retry, and a fallback would answer from a different model without saying so.
+_PERMANENT_ERROR_HINTS = ("invalid parameters", "ai model not found")
+
+
+def _permanent_error_code(failure: Any) -> str:
+    """The terminal provider code for a permanent Cursor configuration failure, else ''."""
+    text = str(failure or "").lower()
+    if any(hint in text for hint in _PERMANENT_ERROR_HINTS):
+        return "cursor_invalid_params"
+    return ""
+
+
 def _prompt_size(usage: Any) -> int:
     """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
     try:
@@ -1610,6 +1623,16 @@ class CursorSDKClient:
             status = str(status_value or "").upper()
             if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
                 close = f"status_{status.lower() or 'error'}"
+                # A permanent configuration failure must not be retried or silently
+                # answered by another provider: mark it terminal for the classifier.
+                code = _permanent_error_code(failure)
+                if code:
+                    raise CursorSDKRunError(
+                        str(failure),
+                        status_code=400,
+                        error_code=code,
+                        body={"error": {"code": code}},
+                    )
                 raise CursorSDKRunError(failure or f"Cursor SDK run ended with status {status}")
             tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
             if tail:
