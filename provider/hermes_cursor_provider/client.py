@@ -4,6 +4,7 @@ from __future__ import annotations
 import atexit
 import asyncio
 import base64
+from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -391,6 +392,32 @@ def _usage(result: Any) -> Any:
             cache_write_tokens=written,
         ),
     )
+
+
+def _with_last_turn_usage(result: Any, turn_usage: Any) -> Any:
+    """Report the LAST turn's usage on the result instead of the SDK's run-wide sum.
+
+    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage``
+    hold a ``TokenUsage`` "summed across every turn that reported usage", while the
+    ``usage`` stream event carries one turn's own numbers. Hermes reads
+    ``usage.prompt_tokens`` as the size of the request it just sent — it is the
+    compression anchor (``agent/usage_anchor.py``: "the provider's real
+    ``usage.prompt_tokens`` is the only authoritative context size") and the input to the
+    session budget. Reporting the run total therefore inflates the session by the number
+    of turns the run took: on session 20261020_114123_d32a239c, call #15 reported
+    598,980 for a ~241,305-token prompt, which anchored the session above its 500,000
+    window and failed every later turn closed as "too large to compress further" — the
+    local transcript held only ~16k tokens, so no compression pass could ever help.
+
+    Degrades to the result's own usage when no per-turn event was seen or the result
+    refuses the swap; a missing number must never fail a run.
+    """
+    if turn_usage is None:
+        return result
+    try:
+        return replace(result, usage=turn_usage)
+    except Exception:  # noqa: BLE001 - diagnostics must not fail a turn
+        return result
 
 
 def _tool_delta(call: Any, index: int) -> Any:
@@ -1149,6 +1176,9 @@ class _RunPump:
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.run: Any = None
         self.abandoned = False
+        # The LAST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
+        # run-wide sum, so it can never stand in for one prompt (see _with_last_turn_usage).
+        self.last_turn_usage: Any = None
         self._thread = threading.Thread(
             target=self._work, name="cursor-sdk-run", daemon=True
         )
@@ -1209,6 +1239,13 @@ class _RunPump:
                     status = str(getattr(event, "status", "") or "").upper()
                     if status in {"ERROR", "CANCELLED", "EXPIRED"}:
                         failure = str(getattr(event, "message", "") or status)
+                elif kind == "usage":
+                    # One event per turn that reported usage, carrying THAT turn's numbers
+                    # (Cursor Python guide, "Token usage"). The last one is the closest
+                    # stand-in for the prompt Hermes actually asked for.
+                    turn_usage = getattr(event, "usage", None)
+                    if turn_usage is not None:
+                        self.last_turn_usage = turn_usage
         else:
             iter_text = getattr(run, "iter_text", None)
             if callable(iter_text):
@@ -1545,6 +1582,8 @@ class CursorSDKClient:
                     yield from parser.feed(value)
                 elif kind == _RunPump.DONE:
                     result, failure = value
+                    # Prefer this run's last per-turn usage over the SDK's run-wide sum.
+                    result = _with_last_turn_usage(result, pump.last_turn_usage)
                     finished = result
                     close = "done"
                     break
