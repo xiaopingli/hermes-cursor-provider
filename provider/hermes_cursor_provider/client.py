@@ -1582,6 +1582,8 @@ class CursorSDKClient:
         events = 0
         close = "unknown"
         finished: Any = None
+        # The SDK's own run-wide sum, kept for the health line (``in_tokens`` is the peak turn).
+        run_input_tokens = 0
         try:
             while True:
                 try:
@@ -1611,7 +1613,8 @@ class CursorSDKClient:
                     yield from parser.feed(value)
                 elif kind == _RunPump.DONE:
                     result, failure = value
-                    # Prefer this run's peak per-turn usage over the SDK's run-wide sum.
+                    # Record the SDK's sum before the swap, then prefer the run's peak turn.
+                    run_input_tokens = _prompt_size(getattr(result, "usage", None))
                     result = _with_peak_turn_usage(result, pump.peak_turn_usage)
                     finished = result
                     close = "done"
@@ -1667,6 +1670,7 @@ class CursorSDKClient:
                 events=events,
                 prompt=prompt,
                 result=finished,
+                run_input_tokens=run_input_tokens,
             )
 
     def _log_stream_health(
@@ -1680,6 +1684,7 @@ class CursorSDKClient:
         events: int,
         prompt: str,
         result: Any,
+        run_input_tokens: int = 0,
     ) -> None:
         """One structured line per SDK run: the numbers an unattributed stall needs.
 
@@ -1690,6 +1695,11 @@ class CursorSDKClient:
         ``ttfe=-1.00s`` means the run produced no event at all before it closed — the shape that
         a silent hang leaves behind. ``in_tokens=0`` means the run never returned a result, so
         the provider reported no usage (a stall or a timeout), not that it used no tokens.
+
+        ``in_tokens`` is the run's peak per-turn prompt (what Hermes anchors on);
+        ``run_in_tokens`` is the SDK's own run-wide sum. Logging both makes a regression that
+        starts reporting the sum visible in one line: the two differ exactly when the run
+        reported more than one turn.
         """
         try:
             duration = time.monotonic() - started
@@ -1700,7 +1710,7 @@ class CursorSDKClient:
                     tokens = int(_usage(result).prompt_tokens or 0)
             logger.info(
                 "cursor: stream health mode=%s close=%s events=%d ttfe=%.2fs gap=%.2fs "
-                "dur=%.2fs in_tokens=%d prompt_chars=%d session=%s",
+                "dur=%.2fs in_tokens=%d run_in_tokens=%d prompt_chars=%d session=%s",
                 mode,
                 close,
                 events,
@@ -1708,6 +1718,7 @@ class CursorSDKClient:
                 max_gap,
                 duration,
                 tokens,
+                run_input_tokens,
                 len(prompt),
                 _log_session_id(),
             )
