@@ -82,7 +82,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "no_write_back",
         CLIENT,
-        "            session.last_input_tokens = int(_usage(result).prompt_tokens or 0)\n",
+        "            session.last_input_tokens = _context_size_tokens(result, context_usage)\n",
         "",
         "the decision is only useful if the reported tokens are recorded for the next turn",
     ),
@@ -137,7 +137,7 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "in_tokens_always_zero",
         CLIENT,
-        "                    tokens = int(_usage(result).prompt_tokens or 0)",
+        "                    tokens = _context_size_tokens(result, peak_turn_usage)",
         "                    tokens = 0",
         "in_tokens next to prompt_chars is the pair that answers what the provider counts",
     ),

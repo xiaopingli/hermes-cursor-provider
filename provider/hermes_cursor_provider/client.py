@@ -4,7 +4,6 @@ from __future__ import annotations
 import atexit
 import asyncio
 import base64
-from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -377,12 +376,54 @@ def _log_session_id() -> str:
     return text or "-"
 
 
-def _usage(result: Any) -> Any:
+def _token_count(usage: Any, name: str) -> int:
+    """One integer token bucket of a usage record, or 0 when it is absent/unreadable."""
+    try:
+        return int(getattr(usage, name, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prompt_size(usage: Any) -> int:
+    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
+    return _token_count(usage, "input_tokens")
+
+
+def _context_fields(turn_usage: Any) -> dict[str, int]:
+    """Hermes' context-size anchor: ONE turn's prompt, separate from billed totals.
+
+    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage`` hold a
+    ``TokenUsage`` "summed across every turn that reported usage", while the ``usage`` stream
+    event carries one turn's own numbers. Hermes reads ``usage.prompt_tokens`` as billed input
+    but ``usage.initial_prompt_tokens`` — when present — as the size of the request it just
+    sent, which anchors compression and the session budget. Reporting the run sum in that slot
+    inflated a session by its turn count.
+
+    The PEAK, not the last: a run that reports several turns need not finish with its largest
+    prompt, and understating the context lets a session overflow before compression fires.
+
+    ``initial_cached_tokens`` is capped at the anchor because Hermes subtracts it from the
+    prompt; a cache reading larger than the prompt would make the context input bucket negative.
+    """
+    prompt = _prompt_size(turn_usage)
+    if prompt <= 0:
+        return {}
+    cached = _token_count(turn_usage, "cache_read_tokens")
+    return {
+        "initial_prompt_tokens": prompt,
+        "initial_cached_tokens": min(max(cached, 0), prompt),
+    }
+
+
+def _usage(result: Any, context_usage: Any = None) -> Any:
+    """Billed totals from the SDK result, plus the one-turn anchor when one is supplied."""
     usage = getattr(result, "usage", None)
-    prompt = int(getattr(usage, "input_tokens", 0) or 0)
-    completion = int(getattr(usage, "output_tokens", 0) or 0)
-    cached = int(getattr(usage, "cache_read_tokens", 0) or 0)
-    written = int(getattr(usage, "cache_write_tokens", 0) or 0)
+    prompt = _token_count(usage, "input_tokens")
+    completion = _token_count(usage, "output_tokens")
+    cached = _token_count(usage, "cache_read_tokens")
+    written = _token_count(usage, "cache_write_tokens")
+    # ``prompt_tokens`` and friends stay the SDK's billed totals. ``initial_*`` is the
+    # separate one-turn context anchor Hermes reads, and only when a per-turn event supplied it.
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
@@ -391,7 +432,30 @@ def _usage(result: Any) -> Any:
             cached_tokens=cached,
             cache_write_tokens=written,
         ),
+        **_context_fields(context_usage),
     )
+
+
+def _context_size_tokens(result: Any, context_usage: Any = None) -> int:
+    """The peak turn when one was seen, otherwise the billed prompt.
+
+    Session retirement and the stream-health ``in_tokens`` field both need one prompt's
+    size. ``usage.prompt_tokens`` is the billed total and must not be substituted here
+    once a per-turn event exists.
+    """
+    reported = _usage(result, context_usage)
+    return int(getattr(reported, "initial_prompt_tokens", 0) or reported.prompt_tokens or 0)
+
+
+def _larger_turn(left: Any, right: Any) -> Any:
+    """The per-turn usage with the bigger prompt, or whichever side exists.
+
+    A plan-nudge is a second run of the same turn. The context anchor is one prompt, so
+    the two peaks are compared, never added.
+    """
+    if _prompt_size(right) > _prompt_size(left):
+        return right
+    return left if left is not None else right
 
 
 # Cursor failure texts that describe a CONFIGURATION error: identical parameters can never
@@ -405,45 +469,6 @@ def _permanent_error_code(failure: Any) -> str:
     if any(hint in text for hint in _PERMANENT_ERROR_HINTS):
         return "cursor_invalid_params"
     return ""
-
-
-def _prompt_size(usage: Any) -> int:
-    """The prompt-token count of one usage record, or 0 when it is absent/unreadable."""
-    try:
-        return int(getattr(usage, "input_tokens", 0) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _with_peak_turn_usage(result: Any, turn_usage: Any) -> Any:
-    """Report the run's LARGEST per-turn usage instead of the SDK's run-wide sum.
-
-    Cursor's Python guide ("Token usage") is explicit: ``run.usage`` / ``result.usage``
-    hold a ``TokenUsage`` "summed across every turn that reported usage", while the
-    ``usage`` stream event carries one turn's own numbers. Hermes reads
-    ``usage.prompt_tokens`` as the size of the request it just sent — it is the
-    compression anchor (``agent/usage_anchor.py``: "the provider's real
-    ``usage.prompt_tokens`` is the only authoritative context size") and the input to the
-    session budget. Reporting the run total therefore inflates the session by the number
-    of turns the run took: on session 20261020_114123_d32a239c, call #15 reported
-    598,980 for a ~241,305-token prompt, which anchored the session above its 500,000
-    window and failed every later turn closed as "too large to compress further" — the
-    local transcript held only ~16k tokens, so no compression pass could ever help.
-
-    The PEAK, not the last: when a run reports several turns, a later turn can carry a
-    smaller prompt than an earlier one, so "whatever arrived last" is not reliably the
-    thread's largest reading. The peak stays inside the documented contract (one turn's
-    numbers) and can never exceed a single turn, so the sum can never come back.
-
-    Degrades to the result's own usage when no per-turn event was seen or the result
-    refuses the swap; a missing number must never fail a run.
-    """
-    if turn_usage is None:
-        return result
-    try:
-        return replace(result, usage=turn_usage)
-    except Exception:  # noqa: BLE001 - diagnostics must not fail a turn
-        return result
 
 
 def _tool_delta(call: Any, index: int) -> Any:
@@ -630,7 +655,7 @@ def _next_or_stop(iterator: Any) -> Any:
 
 
 def _drain(execution: Any) -> Any:
-    """Exhaust an execution generator and return its (result, calls, content)."""
+    """Exhaust an execution generator and return its (result, calls, content, context_usage)."""
     while True:
         try:
             next(execution)
@@ -1202,8 +1227,8 @@ class _RunPump:
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.run: Any = None
         self.abandoned = False
-        # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
-        # run-wide sum, so it can never stand in for one prompt (see _with_peak_turn_usage).
+        # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` stays the SDK's
+        # run-wide sum; this peak rides out beside it as the context anchor (see _context_fields).
         self.peak_turn_usage: Any = None
         self._thread = threading.Thread(
             target=self._work, name="cursor-sdk-run", daemon=True
@@ -1489,7 +1514,7 @@ class CursorSDKClient:
         Some models (notably Grok at high effort) announce "I'll read the file..." and stop,
         expecting a native tool call that this prompt-protocol transport never sees. Without
         a nudge Hermes treats the announcement as the final answer and closes the task."""
-        result, calls, content = yield from self._run_once(
+        result, calls, content, peak = yield from self._run_once(
             agent,
             prompt=prompt,
             images=images,
@@ -1499,11 +1524,11 @@ class CursorSDKClient:
             mode=mode,
         )
         if calls or not allowed_names or not _plan_nudge_enabled() or not _looks_like_plan(content):
-            return result, calls, content
+            return result, calls, content, peak
         # The streaming builder resets its hold here: everything before this point was an
         # announcement, not the answer.
         yield ("reply", None)
-        result, calls, more = yield from self._run_once(
+        result, calls, more, nudged_peak = yield from self._run_once(
             agent,
             prompt=PLAN_NUDGE,
             images=[],
@@ -1512,12 +1537,15 @@ class CursorSDKClient:
             holder=holder,
             mode=mode,
         )
+        # Billing stays the answering run's SDK total. The anchor is the larger of the two
+        # peaks: adding them would report a context the session never held.
+        peak = _larger_turn(peak, nudged_peak)
         if calls:
             # The turn continues with a tool call, but a FINAL: prefix the nudged reply
             # emitted anyway must not reach the delivered text or session history.
             return result, calls, "\n\n".join(
                 part for part in (content, _strip_final_marker(more)) if part
-            )
+            ), peak
         if not _FINAL_RE.match(str(more or "")):
             # Two strikes: the nudge was answered with another announcement. Raise HERE,
             # before this turn is stored and before the streaming builder emits anything,
@@ -1534,7 +1562,7 @@ class CursorSDKClient:
         # otherwise carry it mid-text, and the model would imitate it next turn.
         return result, calls, "\n\n".join(
             part for part in (content, _strip_final_marker(more)) if part
-        )
+        ), peak
 
     def _run_once(
         self,
@@ -1549,10 +1577,11 @@ class CursorSDKClient:
     ) -> Any:
         """Run one agent turn, yielding ('text'|'call', value) events as they stream.
 
-        Returns (result, calls, content) — the extraction the buffered path used,
-        produced incrementally so callers see text before the SDK run completes.
+        Returns (result, calls, content, context_usage) — the extraction the buffered path
+        used, produced incrementally so callers see text before the SDK run completes.
         ``calls`` is the merged list: this run's reconciled native calls, or the
-        honoured parser calls when none were delivered.
+        honoured parser calls when none were delivered. ``context_usage`` is this run's
+        peak per-turn usage (or None); ``result.usage`` keeps the SDK's billed run total.
 
         The blocking SDK work runs on a ``_RunPump`` thread; this generator reads its
         queue against a wall-clock deadline, so a stalled run raises instead of
@@ -1613,9 +1642,8 @@ class CursorSDKClient:
                     yield from parser.feed(value)
                 elif kind == _RunPump.DONE:
                     result, failure = value
-                    # Record the SDK's sum before the swap, then prefer the run's peak turn.
+                    # Billed usage stays the SDK sum. The peak turn rides out beside the result.
                     run_input_tokens = _prompt_size(getattr(result, "usage", None))
-                    result = _with_peak_turn_usage(result, pump.peak_turn_usage)
                     finished = result
                     close = "done"
                     break
@@ -1642,7 +1670,7 @@ class CursorSDKClient:
                 yield from parser.feed(tail)
             yield from parser.flush()
             close = "done"
-            return result, _merged_calls(holder, event_ids, parser.calls), parser.text
+            return result, _merged_calls(holder, event_ids, parser.calls), parser.text, pump.peak_turn_usage
         except GeneratorExit:
             # The consumer stopped reading (a cancelled turn): a close reason of its own, not
             # an error. BaseException handling below still cancels the worker.
@@ -1671,6 +1699,7 @@ class CursorSDKClient:
                 prompt=prompt,
                 result=finished,
                 run_input_tokens=run_input_tokens,
+                peak_turn_usage=pump.peak_turn_usage,
             )
 
     def _log_stream_health(
@@ -1685,6 +1714,7 @@ class CursorSDKClient:
         prompt: str,
         result: Any,
         run_input_tokens: int = 0,
+        peak_turn_usage: Any = None,
     ) -> None:
         """One structured line per SDK run: the numbers an unattributed stall needs.
 
@@ -1707,7 +1737,7 @@ class CursorSDKClient:
             tokens = 0
             if result is not None:
                 with suppress(Exception):
-                    tokens = int(_usage(result).prompt_tokens or 0)
+                    tokens = _context_size_tokens(result, peak_turn_usage)
             logger.info(
                 "cursor: stream health mode=%s close=%s events=%d ttfe=%.2fs gap=%.2fs "
                 "dur=%.2fs in_tokens=%d run_in_tokens=%d prompt_chars=%d session=%s",
@@ -1784,7 +1814,7 @@ class CursorSDKClient:
     ) -> Any:
         """Run one logical turn, yielding ('text'|'call', value) as the SDK streams.
 
-        Returns (result, calls, content). Non-stream callers drain it; stream callers
+        Returns (result, calls, content, context_usage). Non-stream callers drain it; stream callers
         convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
         _split_model(model)  # reject malformed model parameters before launching the bridge
@@ -1889,7 +1919,7 @@ class CursorSDKClient:
             prompt, allowed_names = render_prompt(
                 request_messages, tools=tools, tool_choice=tool_choice, native_tools=bool(specs)
             )
-            result, calls, content = yield from self._run_agent(
+            result, calls, content, context_usage = yield from self._run_agent(
                 session.agent,
                 prompt=prompt,
                 images=extract_images(request_messages),
@@ -1899,11 +1929,10 @@ class CursorSDKClient:
                 mode="persistent",
             )
             session.history = incoming + [_assistant_history(content, calls)]
-            # Record what this call actually submitted, so the next turn can decide whether
-            # the SDK thread has outgrown its budget. Success path only: when _run_agent
-            # raises, `result` is unbound and CursorSDKRunError carries no usage.
-            session.last_input_tokens = int(_usage(result).prompt_tokens or 0)
-            return result, calls, content
+            # Record the peak turn (or the billed prompt when no per-turn event arrived), so
+            # the next turn retires on one prompt's size rather than the SDK's run sum.
+            session.last_input_tokens = _context_size_tokens(result, context_usage)
+            return result, calls, content, context_usage
         except BaseException as exc:
             if isinstance(exc, CursorSDKRunError):
                 # Diagnostic only — nothing reads this; the message is the observable channel.
@@ -1942,7 +1971,7 @@ class CursorSDKClient:
                 _cursor_session_scope=_cursor_session_scope,
                 _cursor_stream_control=_cursor_stream_control,
             )
-        result, calls, content = _drain(self._execute(
+        result, calls, content, context_usage = _drain(self._execute(
             model=model, messages=messages or [], tools=tools, tool_choice=tool_choice,
             timeout=_timeout_seconds(timeout), session_scope=str(_cursor_session_scope or "").strip(),
         ))
@@ -1964,7 +1993,7 @@ class CursorSDKClient:
                     finish_reason="tool_calls" if calls else "stop",
                 )
             ],
-            usage=_usage(result),
+            usage=_usage(result, context_usage),
         )
         return completion
 
@@ -2053,7 +2082,7 @@ class CursorSDKClient:
                 try:
                     kind, value = next(execution)
                 except StopIteration as stop:
-                    result, calls, _ = stop.value
+                    result, calls, _, context_usage = stop.value
                     break
                 if kind == "reply":
                     # The announcement is not the answer: drop its held text. (The sync
@@ -2111,7 +2140,7 @@ class CursorSDKClient:
                 object="chat.completion.chunk",
                 model=response_model,
                 choices=[],
-                usage=_usage(result),
+                usage=_usage(result, context_usage),
             )
         finally:
             execution.close()
