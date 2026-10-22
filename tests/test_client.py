@@ -3342,3 +3342,33 @@ def test_an_abandoned_run_is_still_cancelled(caplog, monkeypatch):
     while runs and not runs[0].cancelled and time.monotonic() < deadline:
         time.sleep(0.01)
     assert runs and runs[0].cancelled, "a run created inside a timed-out send was not cancelled"
+
+
+def test_the_build_line_names_the_serving_build_once(caplog):
+    """An install writes files; only this line proves the process loaded them.
+
+    Hermes keeps an already-imported provider module in memory, so a restart is the only
+    thing that activates a new build. Reading the line the serving process emitted is how
+    that is verified without guessing from file timestamps.
+    """
+    client_module._BUILD_LOGGED = False
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    CursorSDKClient(api_key="crsr_test")
+    CursorSDKClient(api_key="crsr_test")
+    lines = [r.getMessage() for r in caplog.records if "cursor: build" in r.getMessage()]
+    assert len(lines) == 1, "the build line must fire once per process, not per client"
+    assert "version=" in lines[0] and "unknown" not in lines[0]
+    assert "anchor=on" in lines[0] and "deadline=on" in lines[0]
+
+
+def test_the_usage_line_shows_billed_total_against_the_anchor(caplog):
+    """The one line that cannot be produced by a build without the anchor."""
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    result = SimpleNamespace(usage=_usage_of(400_000, output=20, cached=5))
+    usage = client_module._usage(result, _usage_of(241_000, cached=5))
+    assert usage.prompt_tokens == 400_000
+    assert usage.initial_prompt_tokens == 241_000
+    lines = [r.getMessage() for r in caplog.records if "cursor: usage" in r.getMessage()]
+    assert lines, "no usage line was logged"
+    assert "prompt_tokens=400000" in lines[0]
+    assert "initial_prompt_tokens=241000" in lines[0]
