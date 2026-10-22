@@ -89,8 +89,8 @@ MUTATIONS: list[tuple[str, str, str, str, str]] = [
     (
         "guard_ignores_budget",
         CLIENT,
-        "(not extends or toolset_changed or over_budget)",
-        "(not extends or toolset_changed)",
+        "(not extends or over_budget)",
+        "(not extends)",
         "a computed retire decision that the guard ignores is dead logic",
     ),
     (
