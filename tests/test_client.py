@@ -2766,3 +2766,40 @@ def test_the_usage_line_shows_billed_total_against_the_anchor(caplog):
     assert lines, "no usage line was logged"
     assert "prompt_tokens=400000" in lines[0]
     assert "initial_prompt_tokens=241000" in lines[0]
+
+
+def test_build_line_claims_its_once_slot_only_when_routing_is_live(monkeypatch):
+    """A record dropped before logging is wired must not consume the once-only slot.
+
+    In a cron/worker process the client is constructed before that process's log routing is
+    live. Claiming the flag first made the constructor's call swallow the build line and turned
+    every later call — including the one on ``_execute`` entry — into a no-op, so the single line
+    built to answer "which build is serving?" could truthfully answer nothing at all.
+    """
+    emitted: list[tuple] = []
+
+    class FakeLogger:
+        def __init__(self, live: bool) -> None:
+            self.live = live
+
+        def hasHandlers(self) -> bool:  # noqa: N802 - mirrors logging.Logger
+            return self.live
+
+        def info(self, *args, **kwargs) -> None:
+            emitted.append(args)
+
+    fake = FakeLogger(live=False)
+    monkeypatch.setattr(client_module, "logger", fake)
+    monkeypatch.setattr(client_module, "_BUILD_LOGGED", False, raising=False)
+
+    client_module._log_build_once()
+    assert emitted == [], "emitted a record with no live routing"
+    assert client_module._BUILD_LOGGED is False, "spent the once-only slot without emitting"
+
+    fake.live = True
+    client_module._log_build_once()
+    assert len(emitted) == 1
+    assert client_module._BUILD_LOGGED is True
+
+    client_module._log_build_once()
+    assert len(emitted) == 1, "the build line printed twice"

@@ -73,8 +73,6 @@ class CursorSDKRunError(RuntimeError):
             # The classifier reads the code off the parsed body (agent/error_classifier.py),
             # so the structured copy must travel with the exception, not only the attribute.
             self.body = body
-        # Diagnostic only — nothing reads this. If it must be observable, put it in the message.
-        self.recorded_calls: list[Any] = []
 
 
 def _plain(value: Any) -> Any:
@@ -393,11 +391,18 @@ def _log_build_once() -> None:
     global _BUILD_LOGGED
     if _BUILD_LOGGED:
         return
-    _BUILD_LOGGED = True
+    # A record emitted before this process's logging is wired goes nowhere, so the once-only
+    # slot must not be claimed first: in a cron/worker process the constructor ran before log
+    # routing was live, consumed the flag, and the build line never appeared at all — the exact
+    # false negative this line exists to prevent. Only a logger that can receive the record gets
+    # the slot; the call on _execute entry retries once routing is up.
+    if not logger.hasHandlers():
+        return
     logger.info(
         "cursor: build version=%s anchor=on deadline=on",
         _build_version(),
     )
+    _BUILD_LOGGED = True
 
 
 def _context_fields(turn_usage: Any) -> dict[str, int]:

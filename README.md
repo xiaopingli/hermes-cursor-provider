@@ -13,7 +13,7 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Disables Cursor built-in tools and MCP servers, gives each SDK agent a private working directory, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and offers Hermes' tools to Cursor as native custom tools. Those callbacks never execute a tool: each queues the call and acks it, and Hermes runs it after the turn through its normal approval loop, so tool execution never escapes Hermes' approval path. The older `<tool_call>` text protocol is retained only for the path where no tool schemas are supplied; whenever specs are present — every production call — native custom tools are the transport.
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and describes Hermes' tools to the model in the prompt. The model asks for a tool with an in-band `<tool_call>` block; the plugin parses that back into a Hermes tool call, rejecting any name this turn did not offer, and Hermes runs it after the turn through its normal approval loop — so tool execution never escapes Hermes' approval path and the model cannot claim a result it was not given. Cursor's own tool group and MCP servers stay disabled, so there is no native tool handle: a call can only arrive as text the provider understands.
 
 ## Install
 
@@ -24,8 +24,8 @@ hermes model
 ```
 
 > **This fork.** `xiaopingli/hermes-cursor-provider` is a public fork carrying work not yet in the
-> upstream plugin: native custom tools with the queue/ack contract, the bounded session thread, and
-> per-run stream-health logging. Install the fork instead of the stock plugin by swapping the URL:
+> upstream plugin: the bounded session thread, per-run stream-health logging, and the
+> model-variant listing. Install the fork instead of the stock plugin by swapping the URL:
 >
 > ```bash
 > hermes plugins install 'https://github.com/xiaopingli/hermes-cursor-provider.git#provider' --enable
