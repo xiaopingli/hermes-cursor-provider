@@ -2503,12 +2503,12 @@ def test_session_carries_the_reported_input_tokens():
 # the retire decision. Both were mutation holes before these existed.
 
 
-def _usage_of(tokens):
+def _usage_of(tokens, *, output=1, cached=0, written=0):
     return SimpleNamespace(
         input_tokens=tokens,
-        output_tokens=1,
-        cache_read_tokens=0,
-        cache_write_tokens=0,
+        output_tokens=output,
+        cache_read_tokens=cached,
+        cache_write_tokens=written,
     )
 
 
@@ -2557,10 +2557,9 @@ def _multi_turn_run(sdk, *, last_turn_tokens, run_total_tokens, text="done"):
 
 
 def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
-    """Hermes reads ``usage.prompt_tokens`` as the size of the request it just sent.
+    """Billed ``prompt_tokens`` stays the SDK run total; the anchor is one turn.
 
-    It anchors compression and the per-session budget on that number, so a provider
-    adapter must report one prompt — not the run total the Cursor SDK hands back.
+    Hermes anchors compression on ``initial_prompt_tokens``, not on the billed sum.
     """
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
@@ -2572,9 +2571,10 @@ def test_reported_prompt_tokens_is_one_turn_not_the_run_total():
         _cursor_session_scope="scope-turn-usage",
     )
     client.close()
-    assert completion.usage.prompt_tokens == 241_305, (
-        "reported the run's cumulative input instead of the last turn's prompt"
+    assert completion.usage.prompt_tokens == 598_980, (
+        "billed input was replaced by one turn's prompt"
     )
+    assert completion.usage.initial_prompt_tokens == 241_305
 
 
 def test_session_budget_records_one_turn_not_the_run_total():
@@ -2631,7 +2631,8 @@ def test_the_largest_turn_wins_when_a_later_turn_is_smaller():
     )
     completion = _ask(client, _cursor_session_scope="scope-peak-usage")
     client.close()
-    assert completion.usage.prompt_tokens == 13_778, (
+    assert completion.usage.prompt_tokens == 21_995, "billed input was replaced by the peak"
+    assert completion.usage.initial_prompt_tokens == 13_778, (
         "a smaller later turn overwrote the peak prompt reading"
     )
 
@@ -2692,11 +2693,12 @@ def test_usage_event_without_a_value_is_ignored():
     )
     completion = _ask(client, _cursor_session_scope="scope-null-usage")
     client.close()
-    assert completion.usage.prompt_tokens == 500
+    assert completion.usage.prompt_tokens == 9999, "a null event replaced the billed total"
+    assert completion.usage.initial_prompt_tokens == 500
 
 
 def test_streaming_path_reports_the_last_turn_usage():
-    """The streaming builder hands back the same swapped result, so its final chunk agrees."""
+    """The streaming builder reads the same result, so its final chunk carries both fields."""
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
     sdk.result.result = "done"
@@ -2713,7 +2715,8 @@ def test_streaming_path_reports_the_last_turn_usage():
     client.close()
     final = [chunk for chunk in chunks if getattr(chunk, "usage", None)]
     assert final, "no usage-bearing chunk was emitted"
-    assert final[-1].usage.prompt_tokens == 180_000
+    assert final[-1].usage.prompt_tokens == 300_000
+    assert final[-1].usage.initial_prompt_tokens == 180_000
 
 
 def test_ephemeral_path_reports_the_last_turn_usage():
@@ -2732,11 +2735,12 @@ def test_ephemeral_path_reports_the_last_turn_usage():
     )
     completion = _ask(client)
     client.close()
-    assert completion.usage.prompt_tokens == 90_000
+    assert completion.usage.prompt_tokens == 160_000
+    assert completion.usage.initial_prompt_tokens == 90_000
 
 
 def test_result_that_cannot_be_swapped_keeps_its_own_usage():
-    """``replace()`` only works on dataclasses; a result that refuses it must not fail the turn."""
+    """An opaque result keeps its billed usage; the anchor is attached beside it, not by swapping."""
 
     class Opaque:
         def __init__(self, usage):
@@ -2757,11 +2761,148 @@ def test_result_that_cannot_be_swapped_keeps_its_own_usage():
     sdk.create_agent = lambda options: agent
     completion = _ask(client, _cursor_session_scope="scope-opaque")
     client.close()
-    assert completion.usage.prompt_tokens == 4242, "the un-swappable result lost its usage"
+    assert completion.usage.prompt_tokens == 4242, "the opaque result lost its billed usage"
+    assert completion.usage.initial_prompt_tokens == 77, "the anchor did not attach without a usage swap"
+
+
+def test_billed_totals_stay_billed_while_the_anchor_is_the_peak_turn():
+    """Hermes needs both numbers: the SDK's billed run total and one prompt's size.
+
+    ``usage.prompt_tokens`` feeds session totals and cost, so it must stay the sum the
+    SDK reports. ``usage.initial_prompt_tokens`` is the separate context size Hermes
+    anchors compression on. A cache read larger than that prompt is capped at it,
+    because Hermes subtracts the cache figure from the prompt.
+    """
+    for streaming in (False, True):
+        client = CursorSDKClient(api_key="crsr_test")
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        _scripted_client(
+            sdk,
+            [
+                SimpleNamespace(type="usage", usage=_usage_of(240_000, cached=200)),
+                SimpleNamespace(type="usage", usage=_usage_of(241_305, cached=300_000)),
+                _assistant_event("done"),
+            ],
+            usage=_usage_of(598_980, output=1_000, cached=500, written=60),
+        )
+        response = _ask(
+            client, stream=streaming, _cursor_session_scope=f"scope-anchor-split-{streaming}"
+        )
+        usage = (list(response)[-1].usage if streaming else response.usage)
+        client.close()
+        assert usage.prompt_tokens == 598_980, "billing lost the SDK's summed input"
+        assert usage.completion_tokens == 1_000, "billing lost the SDK's summed output"
+        assert usage.prompt_tokens_details.cached_tokens == 500
+        assert usage.prompt_tokens_details.cache_write_tokens == 60
+        assert usage.initial_prompt_tokens == 241_305, "context anchor is not a single turn's prompt"
+        assert usage.initial_cached_tokens == 241_305, "cache read was not capped at the anchor prompt"
+
+
+def test_a_later_smaller_turn_does_not_lower_the_context_anchor():
+    """The anchor is the run's largest turn, not whatever arrived last.
+
+    Billed ``prompt_tokens`` stays the SDK sum. A smaller later turn must not shrink
+    ``initial_prompt_tokens``.
+    """
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [
+            SimpleNamespace(type="usage", usage=_usage_of(13_778, cached=9)),
+            SimpleNamespace(type="usage", usage=_usage_of(8_217, cached=4)),
+            _assistant_event("done"),
+        ],
+        usage=_usage_of(21_995, output=30, cached=13),
+    )
+    completion = _ask(client, _cursor_session_scope="scope-anchor-not-last")
+    client.close()
+    assert completion.usage.prompt_tokens == 21_995, "billed input was replaced by the peak"
+    assert completion.usage.initial_prompt_tokens == 13_778, (
+        "a smaller later turn lowered the context anchor"
+    )
+    assert completion.usage.initial_cached_tokens == 9
+
+
+def test_no_usage_event_reports_no_context_anchor():
+    """A run with no per-turn event keeps its billed usage and invents no anchor."""
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done"
+    _scripted_client(
+        sdk,
+        [_assistant_event("done")],
+        usage=_usage_of(1234, output=8, cached=2),
+    )
+    completion = _ask(client, _cursor_session_scope="scope-no-anchor")
+    client.close()
+    assert completion.usage.prompt_tokens == 1234
+    assert completion.usage.completion_tokens == 8
+    assert not hasattr(completion.usage, "initial_prompt_tokens"), (
+        "invented a context anchor with no per-turn evidence"
+    )
+    assert not hasattr(completion.usage, "initial_cached_tokens")
+
+
+def test_two_recovery_attempts_do_not_sum_the_context_anchor():
+    """A plan-nudge is a second run. The anchor is the max peak, never the sum.
+
+    242k then 240k must anchor 242k, not 482k — summing is what reported 723k for
+    three 240k/241k/242k prompts and failed a session that fit its window. Billing
+    stays the answering run's SDK total; this fork does not add the discarded
+    announcement's bill into ``prompt_tokens``.
+    """
+    plan = "I'll read the file first."
+    for streaming in (False, True):
+        client = CursorSDKClient(api_key="crsr_test")
+        sdk = client._sdk_client()
+        sdk.result.result = "done"
+        runs = [
+            ScriptedRun(
+                FakeResult(
+                    result=plan,
+                    model=sdk.result.model,
+                    usage=_usage_of(242_000, output=10, cached=5, written=1),
+                ),
+                [
+                    SimpleNamespace(type="usage", usage=_usage_of(242_000, cached=5)),
+                    _assistant_event(plan),
+                ],
+            ),
+            ScriptedRun(
+                FakeResult(
+                    result="FINAL: done",
+                    model=sdk.result.model,
+                    usage=_usage_of(500_000, output=20, cached=4, written=2),
+                ),
+                [
+                    SimpleNamespace(type="usage", usage=_usage_of(240_000, cached=4)),
+                    _assistant_event("FINAL: done"),
+                ],
+            ),
+        ]
+        agent = FakeAgent(sdk)
+        agent.send = lambda message: runs.pop(0)
+        sdk.create_agent = lambda options: agent
+        response = _ask(
+            client,
+            tools=[_tool()],
+            stream=streaming,
+            _cursor_session_scope=f"scope-anchor-attempts-{streaming}",
+        )
+        usage = list(response)[-1].usage if streaming else response.usage
+        client.close()
+        assert usage.prompt_tokens == 500_000, "billed input was the peak, or the attempts were summed"
+        assert usage.completion_tokens == 20, "billed output was replaced or summed across attempts"
+        assert usage.prompt_tokens_details.cached_tokens == 4
+        assert usage.initial_prompt_tokens == 242_000, "context anchor summed the attempts or kept the later smaller run"
+        assert usage.initial_cached_tokens == 5
 
 
 def test_nudged_second_run_supplies_the_reported_usage():
-    """After a plan-only nudge the answer is run 2, so its usage is the one to report."""
+    """After a plan-only nudge the answer is run 2, so its billed usage is the one to report."""
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
     sdk.result.result = "done"
