@@ -445,7 +445,9 @@ def test_model_listing_uses_sdk_and_closes_bridge():
     assert FakeCursorClient.launches[0]["allow_api_key_env_fallback"] is False
 
 
-def test_missing_key_and_foreign_base_url_fail_before_launch():
+def test_missing_key_and_foreign_base_url_fail_before_launch(monkeypatch):
+    # A user-scoped turn must fail closed, not quietly borrow the process account.
+    monkeypatch.setenv("CURSOR_API_KEY", "env-wrong-account")
     foreign = CursorSDKClient(api_key="secret", base_url="https://example.com")
     with pytest.raises(ValueError):
         foreign.chat.completions.create(model="auto", messages=[])
@@ -457,6 +459,20 @@ def test_missing_key_and_foreign_base_url_fail_before_launch():
     finally:
         client.close()
     assert FakeCursorClient.launches == []
+
+
+def test_explicit_key_wins_over_the_process_cursor_api_key(monkeypatch):
+    monkeypatch.setenv("CURSOR_API_KEY", "env-wrong-account")
+    client = CursorSDKClient(api_key="crsr_scoped")
+    try:
+        client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.options[0]["api_key"] == "crsr_scoped"
+    assert FakeCursorClient.launches[0]["allow_api_key_env_fallback"] is True
 
 
 def test_session_reuses_agent_across_facades_and_sends_only_delta():
@@ -928,9 +944,9 @@ def test_async_stream_cancellation_cancels_run_and_releases_session():
 
         task = asyncio.create_task(consume())
         assert await asyncio.to_thread(blocked.wait, 5), "async pull never reached the blocked read"
-        # The SDK loop now runs ahead of the consumer (its work is pumped on a worker
-        # thread), so "the SDK reached the next read" no longer implies the first
-        # chunk was pulled. Wait for the delivery itself before cancelling.
+        # The next SDK read starts only after the consumer asked for another chunk, so
+        # the first chunk should already be in ``seen``. Wait anyway: delivery is what
+        # the cancel must not race.
         deadline = time.monotonic() + 5
         while not seen and time.monotonic() < deadline:
             await asyncio.sleep(0.01)
@@ -2958,6 +2974,34 @@ def test_session_retires_agent_when_reported_tokens_reach_the_budget(monkeypatch
     assert sdk.agents[0].closed
     assert '"content":"first"' in sdk.agents[1].messages[0]["text"]
 
+def test_run_client_keeps_the_sdk_native_unary_bound(monkeypatch):
+    """The run deadline must not stretch the SDK's own 30 s unary timeout."""
+    monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 1800.0)
+    client = CursorSDKClient(api_key="crsr_test")
+    try:
+        client.chat.completions.create(
+            model="auto", messages=[{"role": "user", "content": "hi"}]
+        )
+    finally:
+        client.close()
+    sdk = FakeCursorClient.instances[0]
+    assert sdk.timeout_options["unary_timeout"] == 30.0
+
+
+def test_run_timeout_env_parsing(monkeypatch):
+    """The cap reads the environment, falls back on junk, and cannot be switched off."""
+    monkeypatch.delenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", raising=False)
+    assert client_module._run_timeout_seconds() == 1800.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "45")
+    assert client_module._run_timeout_seconds() == 45.0
+    for junk in ("abc", "0", "-5", "", "nan", "inf", "-inf", "1e999"):
+        monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", junk)
+        assert client_module._run_timeout_seconds() == 1800.0, junk
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "999999")
+    assert client_module._run_timeout_seconds() == 86400.0
+    monkeypatch.setenv("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "0.001")
+    assert client_module._run_timeout_seconds() == 0.05
+
 
 def test_session_keeps_agent_under_the_budget(monkeypatch):
     """Below the budget the agent is reused and only the delta is sent."""
@@ -3075,6 +3119,36 @@ def test_stream_health_records_a_successful_ephemeral_run(caplog):
     assert _field(line, "session")  # "-" when no session is bound, never absent
 
 
+_STREAM_HEALTH_FIELDS = (
+    "mode",
+    "close",
+    "events",
+    "ttfe",
+    "gap",
+    "dur",
+    "in_tokens",
+    "run_in_tokens",
+    "prompt_chars",
+    "session",
+)
+
+
+def test_stream_health_line_pins_the_field_set(caplog):
+    """The per-run line's field set and order are a contract; a silent rename or drop must fail."""
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = "done text"
+    sdk.result.usage = _usage_of(4321)
+    client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    client.close()
+    line = _stream_health_lines(caplog)[0]
+    body = line.split("cursor: stream health ", 1)[1]
+    fields = [part.split("=", 1)[0] for part in body.split()]
+    assert tuple(fields) == _STREAM_HEALTH_FIELDS, line
+    assert all("=" in part for part in body.split()), line
+
+
 def test_stream_health_separates_the_peak_turn_from_the_run_sum(caplog):
     """``in_tokens`` is the peak turn Hermes anchors on; ``run_in_tokens`` is the SDK's sum.
 
@@ -3121,10 +3195,11 @@ def test_stream_health_labels_the_persistent_path(caplog):
 def test_stream_health_reports_an_sdk_error(caplog, monkeypatch):
     caplog.set_level(logging.INFO, logger=client_module.logger.name)
 
-    def boom(self):
+    def boom(self, message):
         raise CursorSDKRunError("the worker died")
 
-    monkeypatch.setattr(client_module._RunPump, "_collect", boom)
+    # The pump is gone; a send that raises on the read worker is the same failure.
+    monkeypatch.setattr(FakeAgent, "send", boom)
     client = CursorSDKClient(api_key="crsr_test")
     client._sdk_client()
     with pytest.raises(CursorSDKRunError):
@@ -3140,11 +3215,12 @@ def test_stream_health_reports_an_sdk_error(caplog, monkeypatch):
 def test_stream_health_reports_a_timeout_with_no_events(caplog, monkeypatch):
     caplog.set_level(logging.INFO, logger=client_module.logger.name)
 
-    def hang(self):
+    def hang(self, message):
         time.sleep(2.0)
-        return None, ""
+        return FakeRun(self.owner.result)
 
-    monkeypatch.setattr(client_module._RunPump, "_collect", hang)
+    # A send that never returns is the no-event timeout: no stream pull completed.
+    monkeypatch.setattr(FakeAgent, "send", hang)
     monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 0.05)
     client = CursorSDKClient(api_key="crsr_test")
     client._sdk_client()
@@ -3216,11 +3292,7 @@ def test_env_budget_accepts_the_same_k_and_m_notation_as_the_model_parameter(mon
 
 
 def test_a_completed_run_is_not_cancelled(caplog, monkeypatch):
-    """``_settle`` releases a finished run so nobody cancels it; the exit path must respect that.
-
-    The pump keeps its own handle on the run after ``_settle`` clears the client's, so a
-    cancel placed on the normal exit path would cancel an already-finished run.
-    """
+    """Cancel stays on the abnormal paths; the success exit must not cancel a finished run."""
     caplog.set_level(logging.INFO, logger=client_module.logger.name)
     runs = []
     original_send = FakeAgent.send
@@ -3243,28 +3315,30 @@ def test_a_completed_run_is_not_cancelled(caplog, monkeypatch):
 
 
 def test_an_abandoned_run_is_still_cancelled(caplog, monkeypatch):
-    """The cancel must stay on the abnormal paths — the worker is blocked inside the SDK."""
+    """A send that returns after the deadline must still cancel that run, exactly via late cleanup."""
     caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    release = threading.Event()
     runs = []
     original_send = FakeAgent.send
 
-    def recording_send(self, message):
+    def hanging_send(self, message):
         run = original_send(self, message)
         runs.append(run)
+        release.wait(5)
         return run
 
-    def hang(self):
-        time.sleep(2.0)
-        return None, ""
-
-    monkeypatch.setattr(FakeAgent, "send", recording_send)
-    monkeypatch.setattr(client_module._RunPump, "_collect", hang)
+    monkeypatch.setattr(FakeAgent, "send", hanging_send)
     monkeypatch.setattr(client_module, "_run_timeout_seconds", lambda: 0.05)
     client = CursorSDKClient(api_key="crsr_test")
     client._sdk_client()
-    with pytest.raises(CursorSDKRunError):
-        client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
-    client.close()
-    # The run object is created by the pump's own _collect, so it is not in `runs`; assert the
-    # close reason instead, which is what the timeout path is responsible for.
+    try:
+        with pytest.raises(CursorSDKRunError):
+            client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "hi"}])
+    finally:
+        release.set()
+        client.close()
     assert _field(_stream_health_lines(caplog)[0], "close") == "timeout"
+    deadline = time.monotonic() + 2
+    while runs and not runs[0].cancelled and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert runs and runs[0].cancelled, "a run created inside a timed-out send was not cancelled"
