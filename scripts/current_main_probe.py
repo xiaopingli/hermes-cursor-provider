@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -145,6 +146,15 @@ def main() -> None:
         assert client.api_key == "offline-probe-token"
         assert client.HERMES_SKIP_TRANSPORT_WRAP
         assert client.HERMES_SKIP_ASYNC_WRAP
+        error_module = sys.modules[type(client).__module__]
+        timeout_error = error_module.CursorSDKRunError(
+            "offline deadline", status_code=408, error_code="cursor_run_timeout"
+        )
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        timeout_verdict = classify_api_error(timeout_error)
+        assert timeout_verdict.reason is FailoverReason.timeout
+        assert timeout_verdict.retryable and not timeout_verdict.should_fallback
         client.close()
 
         from agent.auxiliary_client import resolve_provider_client

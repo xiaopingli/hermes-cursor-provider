@@ -8,8 +8,8 @@ import hashlib
 import importlib
 import json
 import logging
+import math
 import os
-import queue
 import re
 import shutil
 import tempfile
@@ -39,11 +39,18 @@ _MAX_MAX_TURN_TOOL_CALLS = 1024
 _ENV_SESSION_TOKEN_BUDGET = "HERMES_CURSOR_SESSION_TOKEN_BUDGET"
 _DEFAULT_SESSION_TOKEN_FRACTION = 1.0
 _STREAM_HEARTBEAT_SECONDS = 60.0
-# Wall-clock cap for one Cursor SDK run. The SDK's send/stream/wait path has no bounded
-# wait of its own; without this a stalled run holds the Hermes turn open indefinitely.
+# Wall-clock cap for one Cursor SDK run. The cap covers the run's Send stream and its
+# result wait; the SDK offers no total-deadline option, so the plugin enforces it.
 _DEFAULT_RUN_TIMEOUT_SECONDS = 1800.0
 _MIN_RUN_TIMEOUT_SECONDS = 0.05
 _MAX_RUN_TIMEOUT_SECONDS = 86_400.0
+# A completed run's ``wait()`` returns from the SDK's cache; this small grace keeps a
+# cached result collectable when the stream consumed the cap exactly.
+_WAIT_COMPLETION_GRACE_SECONDS = 0.05
+# Best-effort cancel/close calls get a short, cap-scaled budget so cleanup cannot add
+# another full transport timeout to a turn that has already hit its deadline.
+_CLEANUP_MIN_SECONDS = 0.1
+_CLEANUP_MAX_SECONDS = 2.0
 
 
 class CursorSDKRunError(RuntimeError):
@@ -1015,8 +1022,9 @@ def _run_timeout_seconds() -> float:
 
     Default 1800 s (30 min): the longest legitimate call seen in the acceptance harness
     was 11.6 min on a 3.9M-token input, so 30 min leaves ~2.5x headroom while still
-    failing well before a 45-60 min run-kill. A malformed or non-positive value falls
-    back to the default — the cap exists to stop the hang, so it cannot be switched off.
+    failing well before a 45-60 min run-kill. A malformed, non-finite, or non-positive
+    value falls back to the default — the cap exists to stop the hang, so it cannot be
+    switched off or turned into an instant timeout.
     """
     raw = os.environ.get("HERMES_CURSOR_RUN_TIMEOUT_SECONDS", "").strip()
     if not raw:
@@ -1026,22 +1034,152 @@ def _run_timeout_seconds() -> float:
     except ValueError:
         logger.warning("cursor: ignoring malformed HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
         return _DEFAULT_RUN_TIMEOUT_SECONDS
-    if value <= 0:
-        logger.warning("cursor: ignoring non-positive HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
+    if not math.isfinite(value) or value <= 0:
+        logger.warning("cursor: ignoring invalid HERMES_CURSOR_RUN_TIMEOUT_SECONDS=%r", raw)
         return _DEFAULT_RUN_TIMEOUT_SECONDS
     return min(max(value, _MIN_RUN_TIMEOUT_SECONDS), _MAX_RUN_TIMEOUT_SECONDS)
 
 
-def _run_timeout_error(cap: float, elapsed: float) -> CursorSDKRunError:
-    """The loud end of a stalled run: a timeout Hermes can retry or fall back from."""
+def _run_timeout_error(cap: float, elapsed: float, phase: str) -> CursorSDKRunError:
+    """The loud end of a stalled run: a retryable timeout Hermes can act on."""
     return CursorSDKRunError(
-        f"Cursor SDK run did not finish within {cap:g}s ({elapsed:g}s elapsed); Hermes "
-        "stopped waiting instead of hanging the turn. Raise "
+        f"Cursor SDK run exceeded its {cap:g}s deadline after {elapsed:g}s while {phase}; "
+        "Hermes stopped waiting instead of hanging the turn. Raise "
         "HERMES_CURSOR_RUN_TIMEOUT_SECONDS if this workload legitimately needs longer.",
         status_code=408,
         error_code="cursor_run_timeout",
+        # The classifier reads the code off the parsed body, so the structured copy
+        # must travel with the exception, not only the attribute.
         body={"error": {"code": "cursor_run_timeout"}},
     )
+
+
+class _ReadOutcome:
+    """Exactly-once handoff between one bounded read and its caller.
+
+    ``publish`` is the worker's claim and ``take`` is the caller's; both decide under
+    one lock. A published value is returned to the caller. An abandoned read hands the
+    value back to ``late`` cleanup. A result that lands at the deadline therefore
+    cannot fall between the two: either the caller takes it, or the worker cleans it up.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._done = threading.Event()
+        self._abandoned = False
+        self.value: Any = None
+        self.error: BaseException | None = None
+
+    def publish(self, *, value: Any = None, error: BaseException | None = None) -> bool:
+        """Publish the read's outcome; False means the caller already gave up."""
+        with self._lock:
+            if self._abandoned:
+                return False
+            self.value = value
+            self.error = error
+            self._done.set()
+            return True
+
+    def wait(self, timeout: float) -> None:
+        self._done.wait(timeout)
+
+    def take(self) -> bool:
+        """Claim the published outcome, or abandon the read for ``late`` cleanup."""
+        with self._lock:
+            if self._done.is_set():
+                return True
+            self._abandoned = True
+            return False
+
+
+def _bounded_call(
+    call: Any,
+    *,
+    deadline: float,
+    cap: float,
+    started: float,
+    phase: str,
+    grace: float = 0.0,
+    late: Any = None,
+) -> Any:
+    """Run one blocking SDK operation on a daemon thread, bounded by ``deadline``.
+
+    ``run.stream()`` is lazy: every ``next()`` and ``run.wait()`` is a separate blocking
+    transport read. Bounding each read against the same deadline keeps delivery lazy and
+    backpressure intact (exactly one read is in flight, and only when the consumer asks)
+    while making the cap cover the real stream/wait path rather than only ``wait()``.
+
+    At the deadline the caller raises immediately; the worker is abandoned (daemon
+    thread) because a wedged transport read cannot be interrupted. ``late`` receives an
+    operation result that arrives after the caller gave up, so a timed-out ``send()`` can
+    still cancel the run it eventually created. ``_ReadOutcome`` guarantees that cleanup
+    runs exactly once, even when the result lands while the caller is timing out.
+    """
+    outcome = _ReadOutcome()
+
+    def _invoke() -> None:
+        try:
+            value = call()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            outcome.publish(error=exc)
+        else:
+            if not outcome.publish(value=value) and late is not None:
+                try:
+                    late(value)
+                except Exception:  # cleanup must never mask the timeout
+                    pass
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 and grace <= 0:
+        raise _run_timeout_error(cap, time.monotonic() - started, phase)
+    # ponytail: one short-lived thread per blocking read. A persistent demand-driven
+    # worker would cut thread churn, but add lifecycle state for no measured gain here.
+    worker = threading.Thread(target=_invoke, name="cursor-sdk-read", daemon=True)
+    worker.start()
+    outcome.wait(max(remaining, grace))
+    if not outcome.take():
+        raise _run_timeout_error(cap, time.monotonic() - started, phase)
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.value
+
+
+def _cleanup_grace_seconds() -> float:
+    """A short, cap-scaled budget for one best-effort cancel/close call."""
+    return max(
+        _CLEANUP_MIN_SECONDS,
+        min(_CLEANUP_MAX_SECONDS, _run_timeout_seconds() / 1000.0),
+    )
+
+
+def _run_cleanup(call: Any, what: str) -> None:
+    """Run one cleanup call without letting a wedged transport add a full timeout.
+
+    Cleanup still happens on a worker so a hung ``CancelRun``/``CloseAgent`` cannot
+    push a turn past its deadline. If it outlives the grace it is abandoned; the SDK's
+    own unary timeout eventually reclaims the worker.
+    """
+    grace = _cleanup_grace_seconds()
+
+    def _invoke() -> None:
+        with suppress(Exception):
+            call()
+
+    worker = threading.Thread(target=_invoke, name="cursor-sdk-cleanup", daemon=True)
+    worker.start()
+    worker.join(grace)
+    if worker.is_alive():
+        logger.warning("cursor: %s did not finish within %gs; abandoning the call", what, grace)
+
+
+def _cancel_run(run: Any) -> None:
+    if run is not None:
+        _run_cleanup(run.cancel, "cancel the Cursor run")
+
+
+def _close_agent(agent: Any) -> None:
+    if agent is not None:
+        _run_cleanup(agent.close, "close the Cursor agent")
 
 
 def _load_cursor_client() -> Any:
@@ -1067,7 +1205,16 @@ class _Bridge:
                     workspace=self.workspace.name,
                     state_root=str(Path(self.workspace.name) / "state"),
                     local={"cwd": self.workspace.name},
-                    allow_api_key_env_fallback=False,
+                    # Local bridge only: the SDK classifies run-scoped CancelRun/
+                    # WaitLiveRun as cloud-routed, and its Client methods carry no
+                    # apiKey, so with the guard on they fail before reaching this
+                    # bridge. The flag's env fallback is not used by this plugin:
+                    # CreateAgent/ListModels always receive the explicit account key,
+                    # Send injects the agent's stored key, and a missing plugin key
+                    # fails in _validate_request before any launch. Run-scoped calls
+                    # carry no key; the local bridge resolves the live run created
+                    # with it.
+                    allow_api_key_env_fallback=True,
                 )
             return self.sdk
 
@@ -1124,8 +1271,7 @@ def _bridge_for(home: str) -> _Bridge:
 
 def _close_session(session: _Session) -> None:
     if session.agent is not None:
-        with suppress(Exception):
-            session.agent.close()
+        _close_agent(session.agent)
         session.agent = None
     session.history.clear()
     shutil.rmtree(session.cwd, ignore_errors=True)
@@ -1195,138 +1341,6 @@ class _StreamControl:
     closed: bool = False
 
 
-class _RunPump:
-    """One Cursor SDK run on its own daemon thread, posting progress to a queue.
-
-    ``Agent.send``, the event stream and ``run.wait()`` block for as long as Cursor
-    takes and the SDK offers no bounded wait, so running them on the caller's thread
-    leaves a turn with no way to stop waiting. The blocking work happens here instead
-    and the caller reads ``queue`` against a wall-clock deadline; when it overruns, the
-    caller raises after :meth:`cancel`. Trade-off: a worker wedged inside the SDK is
-    abandoned (daemon thread) rather than joined — a bounded turn, and one lost thread
-    only when the run was already pathological.
-    """
-
-    EVENT = "event"
-    TEXT = "text"
-    CALL_ID = "call_id"
-    DONE = "done"
-    ERROR = "error"
-
-    def __init__(
-        self,
-        client: "CursorSDKClient",
-        agent: Any,
-        payload: dict[str, Any],
-        control: _StreamControl | None,
-    ) -> None:
-        self._client = client
-        self._agent = agent
-        self._payload = payload
-        self._control = control
-        self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
-        self.run: Any = None
-        self.abandoned = False
-        # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` stays the SDK's
-        # run-wide sum; this peak rides out beside it as the context anchor (see _context_fields).
-        self.peak_turn_usage: Any = None
-        self._thread = threading.Thread(
-            target=self._work, name="cursor-sdk-run", daemon=True
-        )
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def cancel(self) -> None:
-        """Stop waiting: cancel the run if it exists yet; the worker exits on its next step."""
-        self.abandoned = True
-        run = self.run
-        if run is not None:
-            with suppress(Exception):
-                run.cancel()
-
-    def _work(self) -> None:
-        try:
-            result, failure = self._collect()
-        except BaseException as exc:  # noqa: BLE001 - the caller re-raises it
-            self._settle()
-            self.queue.put((self.ERROR, exc))
-            return
-        self._settle()
-        self.queue.put((self.DONE, (result, failure)))
-
-    def _collect(self) -> tuple[Any, str]:
-        run = self._agent.send(self._payload)
-        self.run = run
-        with self._client._runs_lock:
-            self._client._runs.add(run)
-        if self._control is not None:
-            self._control.run = run
-        if self.abandoned or self._client.is_closed or (
-            self._control is not None and self._control.closed
-        ):
-            raise CursorSDKRunError("Cursor stream cancelled during startup")
-        failure = ""
-        stream = getattr(run, "stream", None)
-        if callable(stream):
-            for event in cast(Iterable[Any], stream()):
-                if self.abandoned:
-                    raise CursorSDKRunError("Cursor SDK run abandoned after the wait deadline")
-                kind = str(getattr(event, "type", ""))
-                # A heartbeat point for the streaming builder, which is chunk-silent
-                # while it holds a reply (thinking events included).
-                self.queue.put((self.EVENT, None))
-                if kind == "tool_call":
-                    self.queue.put(
-                        (self.CALL_ID, _normalise_call_id(getattr(event, "call_id", None)))
-                    )
-                elif kind == "assistant":
-                    payload = getattr(event, "message", None)
-                    for block in getattr(payload, "content", ()) or ():
-                        text = str(getattr(block, "text", "") or "")
-                        if text:
-                            self.queue.put((self.TEXT, text))
-                elif kind == "status":
-                    status = str(getattr(event, "status", "") or "").upper()
-                    if status in {"ERROR", "CANCELLED", "EXPIRED"}:
-                        failure = str(getattr(event, "message", "") or status)
-                elif kind == "usage":
-                    # One event per turn that reported usage, carrying THAT turn's numbers
-                    # (Cursor Python guide, "Token usage"). Keep the LARGEST: a run that
-                    # reports several turns need not finish with its biggest prompt, and
-                    # the thread's peak is the conservative reading for a compression anchor.
-                    turn_usage = getattr(event, "usage", None)
-                    if turn_usage is not None and _prompt_size(turn_usage) > _prompt_size(
-                        self.peak_turn_usage
-                    ):
-                        self.peak_turn_usage = turn_usage
-        else:
-            iter_text = getattr(run, "iter_text", None)
-            if callable(iter_text):
-                for part in cast(Iterable[str], iter_text()):
-                    if self.abandoned:
-                        raise CursorSDKRunError("Cursor SDK run abandoned after the wait deadline")
-                    self.queue.put((self.EVENT, None))
-                    text = str(part or "")
-                    if text:
-                        self.queue.put((self.TEXT, text))
-        result = run.wait()
-        return result, failure
-
-    def _settle(self) -> None:
-        """Report the run out of flight *before* the caller sees the report.
-
-        A caller reacting to ``DONE``/``ERROR`` must never observe the run still in
-        ``client._runs`` or still reachable from ``control.run`` for cancellation.
-        """
-        run = self.run
-        if run is not None:
-            with self._client._runs_lock:
-                self._client._runs.discard(run)
-        if self._control is not None and self._control.run is run:
-            self._control.run = None
-
-
 class _LazyStream:
     """One Cursor SDK run exposed as a lazy sync/async chunk stream.
 
@@ -1388,10 +1402,7 @@ class _LazyStream:
             self._iterator.close()
         except ValueError:
             # A worker thread is inside next(); cancel its run so it unwinds there.
-            run = self._control.run
-            if run is not None:
-                with suppress(Exception):
-                    run.cancel()
+            _cancel_run(self._control.run)
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
@@ -1451,8 +1462,7 @@ class CursorSDKClient:
         with self._runs_lock:
             runs = tuple(self._runs)
         for run in runs:
-            with suppress(Exception):
-                run.cancel()
+            _cancel_run(run)
 
     def close(self) -> None:
         if self.is_closed:
@@ -1472,6 +1482,10 @@ class CursorSDKClient:
     ) -> Any:
         client = bridge.client().with_options(
             timeout=timeout,
+            # Keep the SDK's compact unary bound (30 s cap) for setup and for the
+            # agent's run-scoped CancelRun/WaitLiveRun/CloseAgent calls. The plugin's
+            # external deadline bounds how long it waits; stretching the transport's
+            # own timeout would only retain abandoned cleanup workers longer.
             unary_timeout=min(timeout, 30.0),
             stream_timeout=timeout,
         )
@@ -1564,6 +1578,128 @@ class CursorSDKClient:
             part for part in (content, _strip_final_marker(more)) if part
         ), peak
 
+    def _note_stream_pull(self, health: dict[str, Any]) -> None:
+        """Stamp one completed pull, where the consumer actually receives it."""
+        now = time.monotonic()
+        health["events"] += 1
+        first_at = health["first_at"]
+        last_at = health["last_at"]
+        if first_at is None:
+            health["first_at"] = now
+        elif last_at is not None:
+            gap = now - last_at
+            if gap > health["max_gap"]:
+                health["max_gap"] = gap
+        health["last_at"] = now
+
+    def _consume(
+        self,
+        run: Any,
+        parser: "_ToolBlockStream",
+        event_ids: set[str],
+        health: dict[str, Any],
+        *,
+        deadline: float,
+        cap: float,
+        started: float,
+    ) -> Any:
+        """Stream one SDK run into ``parser``; returns (result, streamed, failure, peak).
+
+        Each ``next()`` and ``run.wait()`` is its own bounded read. The next read starts
+        only when this generator is resumed, so a fragment is not pulled until the
+        consumer has taken everything this pull produced. Custom-tool ``execute``
+        callbacks fire on the read worker during ``next()`` and return their ack
+        immediately — they do not wait on a pump thread or on this generator. The
+        ``tool_call`` id is recorded into the live ``event_ids`` set those callbacks
+        already consult, which is what reconciles the queued call at run end.
+        """
+        streamed = ""
+        failure = ""
+        stream = getattr(run, "stream", None)
+        if callable(stream):
+            iterator = iter(cast(Iterable[Any], stream()))
+
+            def _pull() -> Any:
+                return next(iterator)
+
+            while True:
+                try:
+                    event = _bounded_call(
+                        _pull,
+                        deadline=deadline,
+                        cap=cap,
+                        started=started,
+                        phase="reading the run stream",
+                    )
+                except StopIteration:
+                    break
+                self._note_stream_pull(health)
+                # Heartbeat point for the streaming builder, which is chunk-silent
+                # while it holds a reply (thinking events included). This yield does
+                # not start the next read; that waits until the generator resumes.
+                yield ("event", None)
+                kind = str(getattr(event, "type", ""))
+                if kind == "tool_call":
+                    event_ids.add(_normalise_call_id(getattr(event, "call_id", None)))
+                elif kind == "assistant":
+                    payload = getattr(event, "message", None)
+                    for block in getattr(payload, "content", ()) or ():
+                        text = str(getattr(block, "text", "") or "")
+                        if text:
+                            streamed += text
+                            yield from parser.feed(text)
+                elif kind == "status":
+                    status = str(getattr(event, "status", "") or "").upper()
+                    if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                        failure = str(getattr(event, "message", "") or status)
+                elif kind == "usage":
+                    # One event per turn that reported usage, carrying THAT turn's numbers
+                    # (Cursor Python guide, "Token usage"). Keep the LARGEST: a run that
+                    # reports several turns need not finish with its biggest prompt, and
+                    # the thread's peak is the conservative reading for a compression anchor.
+                    turn_usage = getattr(event, "usage", None)
+                    if turn_usage is not None and _prompt_size(turn_usage) > _prompt_size(
+                        health["peak"]
+                    ):
+                        health["peak"] = turn_usage
+        else:
+            iter_text = getattr(run, "iter_text", None)
+            if callable(iter_text):
+                iterator = iter(cast(Iterable[str], iter_text()))
+
+                def _pull_text() -> Any:
+                    return next(iterator)
+
+                while True:
+                    try:
+                        part = _bounded_call(
+                            _pull_text,
+                            deadline=deadline,
+                            cap=cap,
+                            started=started,
+                            phase="reading the run stream",
+                        )
+                    except StopIteration:
+                        break
+                    self._note_stream_pull(health)
+                    yield ("event", None)
+                    text = str(part or "")
+                    if text:
+                        streamed += text
+                        yield from parser.feed(text)
+        result = _bounded_call(
+            run.wait,
+            deadline=deadline,
+            cap=cap,
+            started=started,
+            phase="waiting for the run result",
+            grace=_WAIT_COMPLETION_GRACE_SECONDS,
+        )
+        self._note_stream_pull(health)
+        health["run_input_tokens"] = _prompt_size(getattr(result, "usage", None))
+        health["finished"] = result
+        return result, streamed, failure, health["peak"]
+
     def _run_once(
         self,
         agent: Any,
@@ -1575,7 +1711,7 @@ class CursorSDKClient:
         holder: dict[str, Any] | None = None,
         mode: str = "ephemeral",
     ) -> Any:
-        """Run one agent turn, yielding ('text'|'call', value) events as they stream.
+        """Run one agent turn, yielding ('text'|'call'|'event', value) as they stream.
 
         Returns (result, calls, content, context_usage) — the extraction the buffered path
         used, produced incrementally so callers see text before the SDK run completes.
@@ -1583,73 +1719,70 @@ class CursorSDKClient:
         honoured parser calls when none were delivered. ``context_usage`` is this run's
         peak per-turn usage (or None); ``result.usage`` keeps the SDK's billed run total.
 
-        The blocking SDK work runs on a ``_RunPump`` thread; this generator reads its
-        queue against a wall-clock deadline, so a stalled run raises instead of
-        holding the turn open.
+        Blocking SDK reads (``send``, each stream pull, ``wait``) each run on their own
+        daemon thread against one deadline. Exactly one read is in flight, and only when
+        this generator is resumed, so delivery stays lazy. A stalled read raises instead
+        of holding the turn open. An in-flight transport read cannot be interrupted; its
+        worker is abandoned.
         """
         parser = _ToolBlockStream(allowed_names)
         event_ids: set[str] = set()
         if holder is not None:
             # Publish this run's generation and its (live, mutated-in-place) reconciled id
-            # set before the pump starts, so no callback of this run can precede them. The
-            # nudge's second run gets its own generation, so an earlier run's straggler
-            # can never shadow a legitimate repeat here.
+            # set before ``send()``. A custom-tool callback can fire on the read worker
+            # during the priming read or the first pull, and its ack is the callback's
+            # return value — it must not wait for a thread that only exists while the
+            # read is in flight. The nudge's second run gets its own generation, so an
+            # earlier run's straggler can never shadow a legitimate repeat here.
             holder["gen"] = holder.get("gen", 0) + 1
             holder["event_ids"] = event_ids
         cap = _run_timeout_seconds()
         started = time.monotonic()
         deadline = started + cap
-        pump = _RunPump(self, agent, {"text": prompt, "images": images}, control)
-        pump.start()
-        streamed = ""
-        # Stream-health counters. Timestamps are taken where the caller consumes the queue,
-        # which is where a stall is actually felt; nothing here sits on the token path and no
-        # observer thread is added. One line is emitted at exit, in the finally below.
-        first_at: float | None = None
-        last_at: float | None = None
-        max_gap = 0.0
-        events = 0
+        # Stream-health counters. Timestamps are taken when a pull returns to this
+        # generator, which is where a stall is actually felt. One line is emitted at
+        # exit, in the finally below.
+        health: dict[str, Any] = {
+            "events": 0,
+            "first_at": None,
+            "last_at": None,
+            "max_gap": 0.0,
+            "run_input_tokens": 0,
+            "finished": None,
+            "peak": None,
+        }
         close = "unknown"
-        finished: Any = None
-        # The SDK's own run-wide sum, kept for the health line (``in_tokens`` is the peak turn).
-        run_input_tokens = 0
+        run = None
         try:
-            while True:
-                try:
-                    kind, value = pump.queue.get(
-                        timeout=max(deadline - time.monotonic(), 0.0)
-                    )
-                except queue.Empty:
-                    close = "timeout"
-                    raise _run_timeout_error(cap, time.monotonic() - started) from None
-                now = time.monotonic()
-                events += 1
-                if first_at is None:
-                    first_at = now
-                elif last_at is not None:
-                    gap = now - last_at
-                    if gap > max_gap:
-                        max_gap = gap
-                last_at = now
-                if kind == _RunPump.EVENT:
-                    # A heartbeat point for the streaming builder, which is chunk-silent
-                    # while it holds a reply (thinking events included).
-                    yield ("event", None)
-                elif kind == _RunPump.CALL_ID:
-                    event_ids.add(value)
-                elif kind == _RunPump.TEXT:
-                    streamed += value
-                    yield from parser.feed(value)
-                elif kind == _RunPump.DONE:
-                    result, failure = value
-                    # Billed usage stays the SDK sum. The peak turn rides out beside the result.
-                    run_input_tokens = _prompt_size(getattr(result, "usage", None))
-                    finished = result
-                    close = "done"
-                    break
-                else:  # _RunPump.ERROR: the SDK work raised on the worker thread
-                    close = "sdk_error"
-                    raise value
+            # Start the clock before ``send()``: the SDK's Run constructor primes the
+            # Send stream, so a stalled first byte is part of the run's blocking path too.
+            run = _bounded_call(
+                lambda: agent.send({"text": prompt, "images": images}),
+                deadline=deadline,
+                cap=cap,
+                started=started,
+                phase="starting the SDK run",
+                late=_cancel_run,
+            )
+            with self._runs_lock:
+                self._runs.add(run)
+            if control is not None:
+                control.run = run
+                if control.closed or self.is_closed:
+                    raise CursorSDKRunError("Cursor stream cancelled during startup")
+            try:
+                result, streamed, failure, peak = yield from self._consume(
+                    run,
+                    parser,
+                    event_ids,
+                    health,
+                    deadline=deadline,
+                    cap=cap,
+                    started=started,
+                )
+            finally:
+                with self._runs_lock:
+                    self._runs.discard(run)
             status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
             status = str(status_value or "").upper()
             if failure or status in {"ERROR", "CANCELLED", "EXPIRED"}:
@@ -1670,36 +1803,44 @@ class CursorSDKClient:
                 yield from parser.feed(tail)
             yield from parser.flush()
             close = "done"
-            return result, _merged_calls(holder, event_ids, parser.calls), parser.text, pump.peak_turn_usage
+            return result, _merged_calls(holder, event_ids, parser.calls), parser.text, peak
         except GeneratorExit:
             # The consumer stopped reading (a cancelled turn): a close reason of its own, not
-            # an error. BaseException handling below still cancels the worker.
+            # an error. The run may still be blocked inside a read the caller abandoned.
             close = "consumer_closed"
-            pump.cancel()
+            _cancel_run(run)
             raise
-        except BaseException:
+        except BaseException as exc:
             if close == "unknown":
-                close = "error"
-            # Cancelling is how the worker is stopped: it may be blocked inside the SDK
-            # with no other way to observe that nobody is reading its queue any more.
-            pump.cancel()
+                if getattr(exc, "error_code", None) == "cursor_run_timeout":
+                    close = "timeout"
+                else:
+                    close = "sdk_error"
+            # Cancelling is how a read worker is stopped: it may be blocked inside the SDK
+            # with no other way to observe that nobody is reading any more. A send that
+            # has not returned yet is cancelled by ``late`` instead, exactly once.
+            _cancel_run(run)
             raise
         finally:
-            # Logging only. Cancel deliberately stays on the abnormal paths: after a normal
-            # completion ``_settle`` has already released the run, and the pump's own handle
-            # still points at it, so cancelling here would cancel a finished run — exactly
-            # what ``_settle``'s contract exists to prevent.
+            # Logging only. Cancel deliberately stays on the abnormal paths: a normal
+            # completion has already released the run, and cancelling here would cancel
+            # a finished run.
+            if control is not None and control.run is run:
+                control.run = None
+            if run is not None:
+                with self._runs_lock:
+                    self._runs.discard(run)
             self._log_stream_health(
                 mode=mode,
                 close=close,
                 started=started,
-                first_at=first_at,
-                max_gap=max_gap,
-                events=events,
+                first_at=health["first_at"],
+                max_gap=health["max_gap"],
+                events=health["events"],
                 prompt=prompt,
-                result=finished,
-                run_input_tokens=run_input_tokens,
-                peak_turn_usage=pump.peak_turn_usage,
+                result=health["finished"],
+                run_input_tokens=health["run_input_tokens"],
+                peak_turn_usage=health["peak"],
             )
 
     def _log_stream_health(
@@ -1796,10 +1937,9 @@ class CursorSDKClient:
                     )
                 )
             finally:
+                # Deactivate before close: a callback during close is outside this turn.
                 holder["active"] = False
-                if agent is not None:
-                    with suppress(Exception):
-                        agent.close()
+                _close_agent(agent)
 
     def _execute(
         self,
@@ -1897,8 +2037,7 @@ class CursorSDKClient:
                     budget,
                 )
             if session.agent is not None and (not extends or toolset_changed or over_budget):
-                with suppress(Exception):
-                    session.agent.close()
+                _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
                 # Re-send the whole transcript to the fresh agent; a delta alone would
@@ -1938,8 +2077,7 @@ class CursorSDKClient:
                 # Diagnostic only — nothing reads this; the message is the observable channel.
                 exc.recorded_calls = list(holder["sink"])
             if session.agent is not None:
-                with suppress(Exception):
-                    session.agent.close()
+                _close_agent(session.agent)
             session.agent = None
             session.history.clear()
             raise
