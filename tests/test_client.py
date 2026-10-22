@@ -89,33 +89,6 @@ class FailingRun(FakeRun):
         raise TimeoutError("run timed out")
 
 
-class ToolCallbackRun(FakeRun):
-    """Fires the registered custom tool mid-stream, as the SDK's loopback callback does.
-
-    The real SDK calls ``local.custom_tools[name].execute`` while the run is streaming
-    and emits a ``tool_call`` event carrying the same id; both halves are faked here so
-    the sink entry and the run's event ids can be reconciled.
-    """
-
-    def __init__(self, owner, name):
-        super().__init__(owner.result)
-        self.owner = owner
-        self.name = name
-        self.callback_result = None
-
-    def stream(self):
-        options = self.owner.options[-1] if self.owner.options else {}
-        tools = (options.get("local") or {}).get("custom_tools") or {}
-        entry = tools.get(self.name)
-        if entry is not None:
-            self.callback_result = entry["execute"](
-                {"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe")
-            )
-            self.owner.tool_callbacks.append(self.callback_result)
-            yield SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
-        yield from super().stream()
-
-
 class FakeAgent:
     def __init__(self, owner):
         self.owner = owner
@@ -125,12 +98,6 @@ class FakeAgent:
     def send(self, message):
         self.owner.messages.append(message)
         self.messages.append(message)
-        # Only the newest transcript entry may request a call: the rendered prompt
-        # replays earlier user turns, and those must not re-trigger the callback.
-        tail = str((message or {}).get("text", "")).rsplit('{"role":"user"', 1)[-1]
-        match = re.search(r"CALL\s+(\w+)", tail)
-        if match:
-            return ToolCallbackRun(self.owner, match.group(1))
         return FakeRun(self.owner.result)
 
     def close(self):
@@ -273,36 +240,20 @@ def test_prompt_keeps_hermes_authoritative_and_filters_tool_choice():
     assert "Hermes is the only tool control plane" in prompt
     assert '"name":"read_file"' in prompt
     assert '"name":"write_file"' not in prompt
+    # The in-band <tool_call> block is the only tool protocol the provider has, so it must be
+    # advertised whenever tools are offered, and must not promise a native mechanism.
+    assert "<tool_call>" in prompt
+    assert "native tool-call mechanism" not in prompt
     assert render_prompt([], tools=[_tool()], tool_choice="none")[1] == set()
 
-
-def test_native_prompt_drops_the_text_protocol():
-    prompt, allowed = render_prompt(
-        [{"role": "user", "content": "inspect it"}],
-        tools=[_tool()],
-        native_tools=True,
-    )
-    assert allowed == {"read_file"}
-    assert "offered as native tool calls" in prompt
-    assert "call it directly with the native tool-call mechanism" in prompt
-    assert "<tool_call>" not in prompt
-    assert '"name":"read_file"' in prompt
-
-    # The default (no native tools) still instructs the <tool_call> block protocol.
-    text_prompt, _ = render_prompt([{"role": "user", "content": "inspect it"}], tools=[_tool()])
-    assert "<tool_call>" in text_prompt
-    assert "offered as native tool calls" not in text_prompt
-
-    # tool_choice="none" offers no tools at all, so neither protocol is advertised.
+    # tool_choice="none" offers no tools at all, so no protocol is advertised either.
     none_prompt, none_allowed = render_prompt(
         [{"role": "user", "content": "inspect it"}],
         tools=[_tool()],
         tool_choice="none",
-        native_tools=True,
     )
     assert none_allowed == set()
     assert "<tool_call>" not in none_prompt
-    assert "offered as native tool calls" not in none_prompt
     assert "No Hermes tools are available" in none_prompt
 
 
@@ -348,7 +299,10 @@ def test_sync_completion_uses_official_bridge_with_no_cursor_tools():
         options = sdk.options[0]
         assert options["api_key"] == "crsr_test"
         assert options["model"] == "composer-2.5"
-        assert options["tools"] == ["mcp"]
+        # No custom tools are registered any more, so the agent is offered no tool group
+        # at all: `"mcp"` existed only because that group is what exposes custom tools.
+        # This matches upstream v0.4.1, which passes an empty list here.
+        assert options["tools"] == []
         assert options["mcp_servers"] == {}
         assert "sandbox_options" not in options["local"]
         assert not Path(options["local"]["cwd"]).exists()
@@ -1551,78 +1505,14 @@ def test_legitimate_answer_with_ill_is_nudged_then_marked_final():
     assert "FINAL:" not in content
 
 
-# --- Hermes tools inside Cursor's native loop (custom_tools) ---
-
-
-def test_offered_tools_are_custom_tools():
-    client = CursorSDKClient(api_key="crsr_test")
-    try:
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "say hello"}],
-            tools=[_tool()],
-        )
-    finally:
-        client.close()
-    sdk = FakeCursorClient.instances[0]
-    local = sdk.options[0]["local"]
-    assert set(local["custom_tools"]) == {"read_file"}
-    assert local["custom_tools"]["read_file"]["description"] == (
-        "Read one file" + client_module._TOOL_DESCRIPTION_SUFFIX
-    )
-    assert local["custom_tools"]["read_file"]["input_schema"] == _tool()["function"]["parameters"]
-    assert callable(local["custom_tools"]["read_file"]["execute"])
-
-
-def test_create_agent_offers_only_mcp_tools():
-    client = CursorSDKClient(api_key="crsr_test")
-    try:
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "say hello"}],
-            tools=[_tool()],
-        )
-    finally:
-        client.close()
-    options = FakeCursorClient.instances[0].options[0]
-    # "mcp" is the only capability group that still offers custom_tools; it exposes
-    # no Cursor built-ins (probe-variants.json: every event is name='mcp').
-    assert options["tools"] == ["mcp"]
-    assert options["mcp_servers"] == {}
-
-
-def test_tool_choice_limits_registered_tools():
-    client = CursorSDKClient(api_key="crsr_test")
-    try:
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "hello"}],
-            tools=[_tool(), _tool("write_file")],
-            tool_choice={"type": "function", "function": {"name": "read_file"}},
-        )
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "hello"}],
-            tools=[_tool()],
-            tool_choice="none",
-        )
-    finally:
-        client.close()
-    sdk = FakeCursorClient.instances[0]
-    assert set(sdk.options[0]["local"]["custom_tools"]) == {"read_file"}
-    assert sdk.options[0]["tools"] == ["mcp"]
-    # tool_choice="none" offers nothing at all, so the text-only shape is kept.
-    assert "custom_tools" not in sdk.options[1]["local"]
-    assert sdk.options[1]["tools"] == []
-
-
 @pytest.mark.parametrize("mode", ["one-shot", "session", "busy-session"])
-def test_native_prompt_reaches_the_sdk_at_every_call_site(mode):
-    """Pin the switch where ``_execute`` flips it, not only in ``render_prompt``'s own test.
+def test_text_protocol_reaches_the_sdk_at_every_call_site(mode):
+    """Pin the tool protocol at every production call site, not only in ``render_prompt``'s test.
 
-    The prompt is rendered at three production call sites (the one-shot run, the session
-    run, and the busy-session one-shot fallback). A ``native_tools=False`` at any of them
-    would restore the text protocol while the direct ``render_prompt`` test stayed green.
+    The prompt is rendered at three places (the one-shot run, the session run, and the
+    busy-session one-shot fallback). The provider registers no custom_tools with the SDK, so a
+    site that failed to advertise the in-band ``<tool_call>`` block would leave the model with
+    no way to request a tool at all — while the direct ``render_prompt`` test stayed green.
     """
     client = CursorSDKClient(api_key="crsr_test")
     sdk = client._sdk_client()
@@ -1655,9 +1545,8 @@ def test_native_prompt_reaches_the_sdk_at_every_call_site(mode):
     # The last agent is the one this mode's call site served: the session agent for
     # one-shot/session, the closing one-shot agent for the busy-session fallback.
     sent = sdk.agents[-1].messages[-1]["text"]
-    assert "offered as native tool calls" in sent
-    assert "call it directly with the native tool-call mechanism" in sent
-    assert "<tool_call>" not in sent
+    assert "<tool_call>" in sent
+    assert "native tool-call mechanism" not in sent
     assert '"name":"read_file"' in sent
 
 
@@ -1693,394 +1582,6 @@ def test_no_tools_keeps_text_protocol():
     assert response.choices[0].finish_reason == "stop"
 
 
-def test_callback_returns_tool_call_to_hermes():
-    client = CursorSDKClient(api_key="crsr_test")
-    try:
-        response = client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "CALL hermes_ping with token probe-1"}],
-            tools=[_tool("hermes_ping")],
-        )
-    finally:
-        client.close()
-    sdk = FakeCursorClient.instances[0]
-    assert sdk.tool_callbacks == [client_module._ACK_ACCEPTED]
-    choice = response.choices[0]
-    assert choice.finish_reason == "tool_calls"
-    call = choice.message.tool_calls[0]
-    assert call.id == call.call_id == "call_probe"
-    assert call.type == "function"
-    assert call.function.name == "hermes_ping"
-    assert call.function.arguments == '{"token":"probe-1"}'
-
-
-def _native_turn_messages(content, call):
-    return [
-        {"role": "user", "content": "CALL hermes_ping first"},
-        {
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [
-                {
-                    "id": call.id,
-                    "type": "function",
-                    "function": {"name": call.function.name, "arguments": call.function.arguments},
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": call.id, "content": "pong:probe-1"},
-        {"role": "user", "content": "CALL hermes_ping again"},
-    ]
-
-
-def test_second_turn_call_lands_on_that_turn():
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    try:
-        first = client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "CALL hermes_ping first"}],
-            tools=[_tool("hermes_ping")],
-            _cursor_session_scope="scope-native-turn2",
-        )
-        call = first.choices[0].message.tool_calls[0]
-        second = client.chat.completions.create(
-            model="grok-4.7",
-            messages=_native_turn_messages(first.choices[0].message.content, call),
-            tools=[_tool("hermes_ping")],
-            _cursor_session_scope="scope-native-turn2",
-        )
-    finally:
-        client.close()
-    assert len(sdk.agents) == 1
-    assert len(sdk.agents[0].messages) == 2
-    assert len(first.choices[0].message.tool_calls) == 1
-    assert len(second.choices[0].message.tool_calls) == 1
-    assert second.choices[0].message.tool_calls[0].id == "call_probe"
-
-
-def test_assistant_echo_round_trips_for_next_turn():
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    try:
-        first = client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "CALL hermes_ping first"}],
-            tools=[_tool("hermes_ping")],
-            _cursor_session_scope="scope-native-echo",
-        )
-        call = first.choices[0].message.tool_calls[0]
-        messages = _native_turn_messages(first.choices[0].message.content, call)
-        messages[-1] = {"role": "user", "content": "thanks, continue"}
-        second = client.chat.completions.create(
-            model="grok-4.7",
-            messages=messages,
-            tools=[_tool("hermes_ping")],
-            _cursor_session_scope="scope-native-echo",
-        )
-    finally:
-        client.close()
-    # The assistant echo round-trips, so the `extends` check keeps the same agent.
-    assert len(sdk.agents) == 1
-    assert len(sdk.agents[0].messages) == 2
-    delta = sdk.agents[0].messages[1]["text"]
-    assert '"content":"thanks, continue"' in delta
-    assert '"tool_call_id":"call_probe"' in delta
-    assert '"content":"CALL hermes_ping first"' not in delta
-    assert second.choices[0].finish_reason == "stop"
-
-
-def test_stale_callback_name_is_dropped():
-    """A callback bound to an earlier turn's set is refused by the LIVE allowed set."""
-    holder = {
-        "sink": [],
-        "allowed": {"read_file"},
-        "registered": {"read_file"},
-        "active": True,
-    }
-    specs = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
-    tools = client_module.hermes_tools_as_custom_tools(specs, holder)
-    stale = tools["read_file"]["execute"]
-    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == (
-        client_module._ACK_ACCEPTED
-    )
-    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_stale"]
-
-    # Rebind the SAME dict for the next turn, which did not offer read_file.
-    holder["sink"] = []
-    holder["allowed"] = {"write_file"}
-    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_stale")) == (
-        "refused: tool not offered this turn"
-    )
-    assert holder["sink"] == []
-
-    # Outside the run window, and without an id, nothing is ever accepted.
-    holder["active"] = False
-    assert stale({"path": "x"}, SimpleNamespace(tool_call_id="call_x")) == "refused: no active turn"
-    holder["allowed"] = {"read_file"}
-    holder["active"] = True
-    assert stale({"path": "x"}, SimpleNamespace(tool_call_id=None)).startswith("refused:")
-    assert holder["sink"] == []
-
-
-def test_turn_cap_refuses_the_sixty_fifth_callback():
-    """The 64-call cap is a hard stop: the 65th callback is refused, not queued."""
-    holder = {
-        "sink": [],
-        "allowed": {"read_file"},
-        "registered": {"read_file"},
-        "active": True,
-    }
-    specs = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
-    execute = client_module.hermes_tools_as_custom_tools(specs, holder)["read_file"]["execute"]
-    acks = [
-        execute({"path": f"f{index}.txt"}, SimpleNamespace(tool_call_id=f"call_{index}"))
-        for index in range(65)
-    ]
-    assert acks[:64] == [client_module._ACK_ACCEPTED] * 64
-    assert acks[64] == client_module._ACK_REFUSED_LIMIT.format(cap=64)
-    assert len(holder["sink"]) == 64
-    assert [entry["tool_call_id"] for entry in holder["sink"]] == [
-        f"call_{index}" for index in range(64)
-    ]
-
-
-# --- honest ack, run-scoped dedupe, configurable cap ---
-
-_ACK_ACCEPTED_TEXT = (
-    "accepted by Hermes: this tool is queued and runs after this turn; its result "
-    "arrives in the next message. Do not call it again with the same arguments."
-)
-_ACK_DUPLICATE_TEXT = (
-    "already accepted this turn \u2014 this exact call is queued once; do not repeat it. "
-    "Its result arrives in the next message."
-)
-_ACK_REFUSED_LIMIT_TEXT = (
-    "refused: turn limit of {cap} tool calls reached; the calls already accepted will "
-    "still return their results. State your final answer now."
-)
-_TOOL_DESCRIPTION_SUFFIX_TEXT = (
-    "\n\n(Hermes executes this tool after your turn; its result arrives in the next "
-    "message. Do not repeat a call you have already made this turn.)"
-)
-
-
-def _seeded(gen, ids):
-    """A holder as `_run_once` leaves it: this run's generation and its reconciled ids."""
-    return {
-        "sink": [],
-        "allowed": {"read_file"},
-        "registered": {"read_file"},
-        "active": True,
-        "gen": gen,
-        "event_ids": set(ids),
-    }
-
-
-def _plain():
-    """The four pre-existing keys only: what a hand-built holder looked like before."""
-    return {
-        "sink": [],
-        "allowed": {"read_file"},
-        "registered": {"read_file"},
-        "active": True,
-    }
-
-
-def _execute_on(holder, name="read_file"):
-    specs = [{"name": name, "description": "", "parameters": {"type": "object"}}]
-    return client_module.hermes_tools_as_custom_tools(specs, holder)[name]["execute"]
-
-
-def _ctx(call_id):
-    return SimpleNamespace(tool_call_id=call_id)
-
-
-def _entry(gen, call_id, path="a.txt", name="read_file"):
-    """A full pre-seeded sink entry: the predicate reads name, arguments, id and gen."""
-    return {"name": name, "arguments": {"path": path}, "tool_call_id": call_id, "gen": gen}
-
-
-def test_accepted_ack_is_the_honest_wording_and_appends_one_entry():
-    """Test 1: the in-turn signal says accepted/queued, not a bare 'queued'."""
-    assert client_module._ACK_ACCEPTED == _ACK_ACCEPTED_TEXT
-    holder = _plain()
-    ack = _execute_on(holder)({"path": "a.txt"}, _ctx("call_1"))
-    assert ack == client_module._ACK_ACCEPTED
-    assert ack != "queued"
-    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_1"]
-
-
-def test_identical_repeat_in_one_run_is_collapsed():
-    """Test 2: the same (name, args) twice in one run is queued once and acked as such."""
-    assert client_module._ACK_DUPLICATE == _ACK_DUPLICATE_TEXT
-    holder = _seeded(2, ["call_1"])
-    execute = _execute_on(holder)
-    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
-    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
-    assert len(holder["sink"]) == 1
-    # Guard order is active -> allowed -> call-id -> dedupe: an id-less repeat still takes
-    # the id refusal and is never answered with a positive ack.
-    idless = execute({"path": "a.txt"}, _ctx(None))
-    assert idless.startswith("refused:")
-    assert idless != client_module._ACK_DUPLICATE
-    assert len(holder["sink"]) == 1
-
-
-def test_duplicate_does_not_consume_the_cap(monkeypatch):
-    """Test 3: A, A(dup), B all pass; only a third distinct call is refused at cap 2.
-    Also pins the guard order: at the cap, a repeat still collapses (dedupe before cap)."""
-    monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", "2")
-    holder = _seeded(2, ["call_1"])
-    execute = _execute_on(holder)
-    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
-    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
-    assert execute({"path": "b.txt"}, _ctx("call_3")) == client_module._ACK_ACCEPTED
-    assert execute({"path": "c.txt"}, _ctx("call_4")) == (
-        client_module._ACK_REFUSED_LIMIT.format(cap=2)
-    )
-    # The guard order itself: with the sink already AT the cap, a repeat of a *reconciled*
-    # accepted call must still take the duplicate ack. If the cap were checked before the
-    # dedupe this would be the limit refusal, and nothing else in the suite would notice.
-    # (Only `call_1` is in this holder's event_ids, so only a repeat of `a.txt` is eligible.)
-    assert execute({"path": "a.txt"}, _ctx("call_5")) == client_module._ACK_DUPLICATE
-    assert [entry["tool_call_id"] for entry in holder["sink"]] == ["call_1", "call_3"]
-
-
-@pytest.mark.parametrize(
-    ("raw", "expected", "warns"),
-    [
-        (None, 64, False),
-        ("", 64, False),
-        ("   ", 64, False),
-        ("abc", 64, True),
-        ("0", 64, True),
-        ("-3", 64, True),
-        ("5", 5, False),
-        ("1", 1, False),
-        ("1024", 1024, False),
-        ("99999", 1024, True),
-    ],
-)
-def test_max_turn_tool_calls_env_semantics(monkeypatch, caplog, raw, expected, warns):
-    """Test 4: unset/blank -> default; malformed or <= 0 -> default + warning; else clamped."""
-    if raw is None:
-        monkeypatch.delenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", raising=False)
-    else:
-        monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", raw)
-    with caplog.at_level(logging.WARNING, logger=client_module.__name__):
-        value = client_module._max_turn_tool_calls()
-    assert value == expected
-    assert isinstance(value, int)
-    warned = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert bool(warned) is warns
-    assert client_module._DEFAULT_MAX_TURN_TOOL_CALLS == 64
-    assert client_module._MAX_MAX_TURN_TOOL_CALLS == 1024
-
-
-def test_limit_refusal_tells_the_model_what_still_happens(monkeypatch):
-    """Test 5: the refusal says the limit was reached and accepted calls still return."""
-    assert client_module._ACK_REFUSED_LIMIT == _ACK_REFUSED_LIMIT_TEXT
-    monkeypatch.setenv("HERMES_CURSOR_MAX_TURN_TOOL_CALLS", "1")
-    holder = _plain()
-    execute = _execute_on(holder)
-    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
-    refusal = execute({"path": "b.txt"}, _ctx("call_2"))
-    assert "turn limit" in refusal
-    assert "still return their results" in refusal
-    assert refusal == _ACK_REFUSED_LIMIT_TEXT.format(cap=1)
-    assert len(holder["sink"]) == 1
-
-
-def test_description_suffix_is_on_every_custom_tool():
-    """Test 6: each registered tool says Hermes runs it later; None/missing -> suffix alone."""
-    assert client_module._TOOL_DESCRIPTION_SUFFIX == _TOOL_DESCRIPTION_SUFFIX_TEXT
-    specs = [
-        {"name": "alpha", "description": "Alpha tool", "parameters": {"type": "object"}},
-        {"name": "beta", "description": None, "parameters": {"type": "object"}},
-        {"name": "gamma", "parameters": {"type": "object"}},
-    ]
-    tools = client_module.hermes_tools_as_custom_tools(specs, {})
-    assert tools["alpha"]["description"] == "Alpha tool" + _TOOL_DESCRIPTION_SUFFIX_TEXT
-    assert tools["beta"]["description"] == _TOOL_DESCRIPTION_SUFFIX_TEXT
-    assert tools["gamma"]["description"] == _TOOL_DESCRIPTION_SUFFIX_TEXT
-
-
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "OFF", " 0 "])
-def test_dedupe_kill_switch_lets_the_repeat_through(monkeypatch, value):
-    """Test 7: HERMES_CURSOR_DEDUPE off -> the repeat is accepted; on, the same fixture dedupes."""
-    control = _seeded(2, ["call_1"])
-    execute = _execute_on(control)
-    execute({"path": "a.txt"}, _ctx("call_1"))
-    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
-
-    monkeypatch.setenv("HERMES_CURSOR_DEDUPE", value)
-    holder = _seeded(2, ["call_1"])
-    execute = _execute_on(holder)
-    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
-    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
-    assert len(holder["sink"]) == 2
-
-
-def test_older_generation_entry_does_not_shadow_a_repeat():
-    """Test 8: an earlier run's entry (gen 1) never suppresses the current run's (gen 2) repeat."""
-    holder = _seeded(2, ["call_1"])
-    holder["sink"].append(_entry(1, "call_1"))
-    ack = _execute_on(holder)({"path": "a.txt"}, _ctx("call_2"))
-    assert ack == client_module._ACK_ACCEPTED
-    assert [(e["tool_call_id"], e["gen"]) for e in holder["sink"]] == [("call_1", 1), ("call_2", 2)]
-
-
-def test_unreconciled_entry_does_not_shadow_a_live_repeat():
-    """Test 9: an entry whose id is not in this run's event ids cannot suppress a live call."""
-    holder = _seeded(2, [])
-    holder["sink"].append(_entry(2, "call_1"))
-    assert _execute_on(holder)({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
-    assert len(holder["sink"]) == 2
-
-    # Positive control: the same entry, once reconciled, does suppress the repeat.
-    control = _seeded(2, ["call_1"])
-    control["sink"].append(_entry(2, "call_1"))
-    assert _execute_on(control)({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_DUPLICATE
-    assert len(control["sink"]) == 1
-
-
-def test_each_run_of_a_nudged_turn_gets_its_own_generation():
-    """Test 10: `_run_once` bumps the generation per run, so a nudged turn advances it twice."""
-    client, sdk = _sdk_client()
-    _sequenced(sdk, ["I'll read the file.", _CALL])
-    client.chat.completions.create(
-        model="grok-4.7",
-        messages=[{"role": "user", "content": "apply the fix note"}],
-        tools=[_tool()],
-        _cursor_session_scope="scope-gen-nudged",
-    )
-    nudged = next(iter(client_module._SESSIONS.values())).tool_holder
-    assert nudged["gen"] == 2
-    assert isinstance(nudged["event_ids"], set)
-
-    # Control: a turn with no nudge is one run, so a per-turn bump or a constant 2 would differ.
-    client_module._reset_session_registry()
-    _sequenced(sdk, ["All done."])
-    client.chat.completions.create(
-        model="grok-4.7",
-        messages=[{"role": "user", "content": "apply the fix note"}],
-        tools=[_tool()],
-        _cursor_session_scope="scope-gen-plain",
-    )
-    assert next(iter(client_module._SESSIONS.values())).tool_holder["gen"] == 1
-
-
-def test_holder_without_the_new_keys_survives_the_dedupe_predicate():
-    """Test 11: a hand-built holder with neither new key must not KeyError in the predicate."""
-    holder = _plain()
-    execute = _execute_on(holder)
-    assert execute({"path": "a.txt"}, _ctx("call_1")) == client_module._ACK_ACCEPTED
-    # The sink is non-empty now, so this second identical call enters the predicate.
-    assert execute({"path": "a.txt"}, _ctx("call_2")) == client_module._ACK_ACCEPTED
-    assert len(holder["sink"]) == 2
-
-
 def test_plan_with_zero_callbacks_is_an_error():
     client, sdk = _sdk_client()
     agent = _sequenced(sdk, ["I'll read the file.", "I'll read the file now."])
@@ -2090,59 +1591,6 @@ def test_plan_with_zero_callbacks_is_an_error():
     assert exc_info.value.status_code == 400
     assert exc_info.value.body == {"error": {"code": "cursor_plan_only"}}
     assert len(agent.messages) == 2
-
-
-def test_stream_emits_native_tool_call_deltas():
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    try:
-        chunks = list(
-            client.chat.completions.create(
-                model="grok-4.7",
-                messages=[{"role": "user", "content": "CALL hermes_ping please"}],
-                tools=[_tool("hermes_ping")],
-                stream=True,
-            )
-        )
-    finally:
-        client.close()
-    assert sdk.tool_callbacks == [client_module._ACK_ACCEPTED]
-    assert _stream_text(chunks) == "hello"
-    _assert_held_text_precedes_call_deltas(chunks)
-    calls = _stream_calls(chunks)
-    assert calls and calls[0].function.name == "hermes_ping"
-    assert calls[0].function.arguments == '{"token":"probe-1"}'
-    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
-    assert finals == ["tool_calls"]
-
-
-def test_toolset_change_recreate_resends_transcript():
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    try:
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[{"role": "user", "content": "first-user"}],
-            tools=[_tool("read_file")],
-            _cursor_session_scope="scope-toolset",
-        )
-        client.chat.completions.create(
-            model="grok-4.7",
-            messages=[
-                {"role": "user", "content": "first-user"},
-                {"role": "assistant", "content": "hello"},
-                {"role": "user", "content": "second-user"},
-            ],
-            tools=[_tool("write_file")],
-            _cursor_session_scope="scope-toolset",
-        )
-    finally:
-        client.close()
-    assert len(sdk.agents) == 2
-    assert sdk.agents[0].closed
-    resent = sdk.agents[1].messages[0]["text"]
-    assert '"content":"first-user"' in resent
-    assert '"content":"second-user"' in resent
 
 
 # --- streaming: hold the reply until the turn decides, then emit in a fixed order ---
@@ -2274,60 +1722,6 @@ def test_long_reply_releases_hold_before_run_end():
         client.close()
         worker.join(5)
     assert _stream_text([holder["chunk"]]) + _stream_text(rest) == long_text
-
-
-def test_nudged_reply_native_call_flushes_and_finishes():
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    sdk.result.result = ""
-
-    def call_event(run):
-        entry = sdk.options[-1]["local"]["custom_tools"]["hermes_ping"]
-        sdk.tool_callbacks.append(
-            entry["execute"]({"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe"))
-        )
-        return SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
-
-    _stream_agent(
-        sdk,
-        [[_assistant_event("I'll check.")], [_assistant_event("Checking now."), call_event]],
-    )
-    try:
-        chunks = list(_streamed(client, tools=("hermes_ping",)))
-    finally:
-        client.close()
-    assert _stream_text(chunks) == "Checking now."  # the announcement is dropped at the boundary
-    _assert_held_text_precedes_call_deltas(chunks)
-    calls = _stream_calls(chunks)
-    assert [call.function.name for call in calls] == ["hermes_ping"]
-    finals = [c.choices[0].finish_reason for c in chunks if c.choices and c.choices[0].finish_reason]
-    assert finals == ["tool_calls"]
-
-
-def test_nudged_reply_marker_is_stripped_before_native_call_deltas():
-    """A nudged reply that prefixes FINAL: AND calls must not leak the token to chunks."""
-    client = CursorSDKClient(api_key="crsr_test")
-    sdk = client._sdk_client()
-    sdk.result.result = ""
-
-    def call_event(run):
-        entry = sdk.options[-1]["local"]["custom_tools"]["hermes_ping"]
-        sdk.tool_callbacks.append(
-            entry["execute"]({"token": "probe-1"}, SimpleNamespace(tool_call_id="call_probe"))
-        )
-        return SimpleNamespace(type="tool_call", call_id="call_probe\nfc_0")
-
-    _stream_agent(
-        sdk,
-        [[_assistant_event("I'll check.")], [_assistant_event("FINAL: Checking now."), call_event]],
-    )
-    try:
-        chunks = list(_streamed(client, tools=("hermes_ping",)))
-    finally:
-        client.close()
-    content = _stream_text(chunks)
-    assert content == "Checking now."
-    assert "FINAL:" not in content
 
 
 def test_run_timeout_is_configurable_and_defaults_to_thirty_minutes(monkeypatch):
