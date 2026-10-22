@@ -396,6 +396,42 @@ def _prompt_size(usage: Any) -> int:
     return _token_count(usage, "input_tokens")
 
 
+_BUILD_LOGGED = False
+
+
+def _build_version() -> str:
+    """The version of the plugin that owns this file, read from its manifest.
+
+    Read rather than hard-coded: a constant drifts the moment the release bumps, and this
+    line exists precisely to answer "which build is serving?" from a log.
+    """
+    try:
+        manifest = Path(__file__).resolve().parents[1] / "plugin.yaml"
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip('"\'') or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _log_build_once() -> None:
+    """Say which build started, once per process, so a restart can be verified from a log.
+
+    An install writes files; only this line proves the process that answers requests loaded
+    them. ``anchor`` and ``deadline`` are features of the anchored, bounded build; a module
+    from before those changes cannot claim both.
+    """
+    global _BUILD_LOGGED
+    if _BUILD_LOGGED:
+        return
+    _BUILD_LOGGED = True
+    logger.info(
+        "cursor: build version=%s anchor=on deadline=on",
+        _build_version(),
+    )
+
+
 def _context_fields(turn_usage: Any) -> dict[str, int]:
     """Hermes' context-size anchor: ONE turn's prompt, separate from billed totals.
 
@@ -431,6 +467,15 @@ def _usage(result: Any, context_usage: Any = None) -> Any:
     written = _token_count(usage, "cache_write_tokens")
     # ``prompt_tokens`` and friends stay the SDK's billed totals. ``initial_*`` is the
     # separate one-turn context anchor Hermes reads, and only when a per-turn event supplied it.
+    fields = _context_fields(context_usage)
+    if fields and prompt:
+        # The live discrimination: billed total vs one turn's prompt. A build without the
+        # anchor reports only the billed total, so this line cannot be produced by it.
+        logger.info(
+            "cursor: usage prompt_tokens=%s initial_prompt_tokens=%s",
+            prompt,
+            fields["initial_prompt_tokens"],
+        )
     return SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
@@ -439,7 +484,7 @@ def _usage(result: Any, context_usage: Any = None) -> Any:
             cached_tokens=cached,
             cache_write_tokens=written,
         ),
-        **_context_fields(context_usage),
+        **fields,
     )
 
 
@@ -1436,6 +1481,7 @@ class CursorSDKClient:
         self.is_closed = False
         self._runs: set[Any] = set()
         self._runs_lock = threading.Lock()
+        _log_build_once()
 
     def __enter__(self):
         return self
