@@ -27,12 +27,20 @@ def _cursor_error_verdict(
     disabling credential rotation and provider fallback for all of them. Decline unless
     the structured code proves this is our own raise.
     """
-    if str(error_code or "").strip().lower() not in {
-        "cursor_plan_only",
-        "cursor_invalid_params",
-    }:
+    code = str(error_code or "").strip().lower()
+    # Two different failures, two different reasons. A plan-only exhaustion is not a malformed
+    # request: the model announced an action, was nudged twice, and never produced a call --
+    # ``incomplete_response`` says exactly that, and ``format_error`` would tell the user to
+    # start a clean session over a request that was fine. A rejected model parameter *is* a bad
+    # request, so it keeps ``format_error`` and its accurate copy.
+    reasons = {
+        "cursor_plan_only": "incomplete_response",
+        "cursor_invalid_params": "format_error",
+    }
+    reason = reasons.get(code)
+    if reason is None:
         return None
-    return {"reason": "format_error", "retryable": False, "should_fallback": False}
+    return {"reason": reason, "retryable": False, "should_fallback": False}
 
 
 class CursorProfile(ProviderProfile):

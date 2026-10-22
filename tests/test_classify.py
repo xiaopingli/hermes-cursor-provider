@@ -82,7 +82,9 @@ def test_plan_only_error_is_terminal(tree_profile):
         body={"error": {"code": "cursor_plan_only"}},
     )
     verdict = classify_api_error(exc, provider="cursor", model="grok-4.7")
-    assert verdict.reason == FailoverReason.format_error
+    # Not format_error: the request was well formed; the model simply never acted, and
+    # format_error's terminal copy would misdiagnose it as a malformed request.
+    assert verdict.reason == FailoverReason.incomplete_response
     assert verdict.retryable is False
     assert verdict.should_fallback is False
 
