@@ -39,6 +39,16 @@ def _cursor_error_verdict(
     }
     reason = reasons.get(code)
     if reason is None:
+        # A third raise site carries no code at all: ``_split_model`` rejects a malformed
+        # ``id@key=value`` string -- a typo like ``grok-4.7@xhigh``, a repeated ``@``, an empty
+        # id, a duplicate key -- before the bridge exists, with a plain ValueError whose text
+        # names our own parser. The host reads a ValueError as a local validation bug and answers
+        # the turn from the next provider, silently. Recognise our own text and opt out; the host
+        # honours a verdict that does so even when the exception is a ValueError subclass.
+        first_arg = getattr(error, "args", ())
+        text = str(first_arg[0]) if first_arg else ""
+        if text.startswith("Cursor model parameters"):
+            return {"reason": "format_error", "retryable": False, "should_fallback": False}
         return None
     return {"reason": reason, "retryable": False, "should_fallback": False}
 
