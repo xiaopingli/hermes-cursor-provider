@@ -4,6 +4,7 @@ import asyncio
 import base64
 from dataclasses import dataclass
 import logging
+import os
 from pathlib import Path
 import re
 import sys
@@ -2803,3 +2804,39 @@ def test_build_line_claims_its_once_slot_only_when_routing_is_live(monkeypatch):
 
     client_module._log_build_once()
     assert len(emitted) == 1, "the build line printed twice"
+
+
+def test_build_version_is_never_re_read_from_disk_after_import(monkeypatch):
+    """The logged version must be this process's build, not whatever is on disk now.
+
+    An install replaces plugin.yaml while the running process keeps the module it imported. If
+    the line read the manifest when it logged, an un-restarted process would advertise the new
+    version — the exact false positive DoD 4(a) exists to catch.
+    """
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("build version was re-read from disk at log time")
+
+    monkeypatch.setattr(client_module, "_read_version", _explode)
+    assert client_module._build_version() == client_module._BUILD_VERSION
+    assert client_module._BUILD_VERSION != "unknown"
+
+
+def test_build_line_carries_the_module_digest_and_the_pid(caplog):
+    """digest pins the bytes that were imported; pid pins the process that answered."""
+    caplog.set_level(logging.INFO, logger=client_module.logger.name)
+    client_module._BUILD_LOGGED = False
+    try:
+        client_module._log_build_once()
+    finally:
+        client_module._BUILD_LOGGED = True
+
+    lines = [r.getMessage() for r in caplog.records if "cursor: build version" in r.getMessage()]
+    assert lines, "no build line was logged"
+    line = lines[0]
+    # The historical prefix is preserved so existing greps keep working.
+    assert f"cursor: build version={client_module._BUILD_VERSION} anchor=on deadline=on" in line
+    assert f"digest={client_module._BUILD_DIGEST}" in line
+    assert f"pid={os.getpid()}" in line
+    assert len(client_module._BUILD_DIGEST) == 12
+    assert all(c in "0123456789abcdef" for c in client_module._BUILD_DIGEST)

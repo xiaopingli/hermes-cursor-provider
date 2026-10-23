@@ -365,28 +365,53 @@ def _prompt_size(usage: Any) -> int:
 _BUILD_LOGGED = False
 
 
-def _build_version() -> str:
-    """The version of the plugin that owns this file, read from its manifest.
-
-    Read rather than hard-coded: a constant drifts the moment the release bumps, and this
-    line exists precisely to answer "which build is serving?" from a log.
-    """
+def _read_version() -> str:
+    """The version the manifest declares. Read once, at import, by ``_capture_build``."""
     try:
         manifest = Path(__file__).resolve().parents[1] / "plugin.yaml"
         for line in manifest.read_text(encoding="utf-8").splitlines():
             if line.startswith("version:"):
-                return line.split(":", 1)[1].strip().strip('"\'') or "unknown"
+                return line.split(":", 1)[1].strip().strip("\"'") or "unknown"
     except Exception:
         pass
     return "unknown"
 
 
+def _capture_build() -> tuple[str, str]:
+    """``(version, content digest)`` of the module *this process* imported.
+
+    Captured at import and never re-read. An install replaces ``plugin.yaml`` and ``client.py``
+    while the running process keeps the module it already imported, so a function that read the
+    manifest at log time would report the NEW version from the OLD module — telling an operator a
+    restart had landed when it had not. That is the one false positive this line exists to
+    prevent.
+
+    The digest separates two installs that share a version string, such as a release tag and
+    that tag plus a carried patch series, where the manifest cannot tell them apart.
+    """
+    try:
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except Exception:
+        digest = "unknown"
+    return _read_version(), digest
+
+
+_BUILD_VERSION, _BUILD_DIGEST = _capture_build()
+
+
+def _build_version() -> str:
+    """The version captured when this module was imported — see ``_capture_build``."""
+    return _BUILD_VERSION
+
+
 def _log_build_once() -> None:
-    """Say which build started, once per process, so a restart can be verified from a log.
+    """Say which build this process loaded, once per process, so a restart can be verified.
 
     An install writes files; only this line proves the process that answers requests loaded
-    them. ``anchor`` and ``deadline`` are features of the anchored, bounded build; a module
-    from before those changes cannot claim both.
+    them. ``anchor`` and ``deadline`` are features of the anchored, bounded build; a module from
+    before those changes cannot claim both. ``digest`` is the module file as it was at import and
+    ``pid`` is the process that logged, so the line can be tied to a gateway process rather than
+    to whichever CLI run wrote last.
     """
     global _BUILD_LOGGED
     if _BUILD_LOGGED:
@@ -399,8 +424,10 @@ def _log_build_once() -> None:
     if not logger.hasHandlers():
         return
     logger.info(
-        "cursor: build version=%s anchor=on deadline=on",
-        _build_version(),
+        "cursor: build version=%s anchor=on deadline=on digest=%s pid=%s",
+        _BUILD_VERSION,
+        _BUILD_DIGEST,
+        os.getpid(),
     )
     _BUILD_LOGGED = True
 
