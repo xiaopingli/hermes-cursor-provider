@@ -135,3 +135,36 @@ def test_run_timeout_is_not_swallowed_by_the_plan_only_hook(tree_profile):
     assert verdict.reason == FailoverReason.timeout
     assert verdict.retryable is True
     assert verdict.should_fallback is False
+
+
+# A THIRD raise site carries no code at all: ``_split_model`` rejects a malformed
+# ``id@key=value`` string before the bridge exists, with a plain ValueError. The host reads a
+# ValueError as a local validation bug and answers the turn from another provider unless the
+# profile hook recognises its own text and opts out. Pin every shape the parser can emit, and pin
+# that an unrelated ValueError is still declined — a hook that swallowed all of them would turn
+# genuine local bugs into terminal errors with no fallback at all.
+@pytest.mark.parametrize(
+    "value",
+    [
+        "grok-4.7@xhigh",            # a part that is not key=value
+        "grok-4.7@reasoning_effort", # likewise, no '='
+        "grok-4.7@a=1,a=2",          # a repeated key
+        "@fast=true",                # an empty model id
+        # NB the fork's parser accepts a second '@' (the model id keeps it), so that shape is not
+        # a raise here; the upstream tag's parser rejects it. Only shapes that raise are pinned.
+    ],
+)
+def test_a_malformed_parameter_string_is_terminal_not_a_local_bug(tree_profile, value):
+    client = sys.modules[f"{_MODULE}.hermes_cursor_provider.client"]
+    with pytest.raises(ValueError) as excinfo:
+        client._split_model(value)
+    verdict = classify_api_error(excinfo.value, provider="cursor", model="grok-4.7")
+    assert verdict.reason == FailoverReason.format_error
+    assert verdict.retryable is False
+    assert verdict.should_fallback is False
+
+
+def test_an_unrelated_value_error_is_still_declined(tree_profile):
+    verdict = classify_api_error(ValueError("boom"), provider="cursor", model="grok-4.7")
+    assert verdict.reason == FailoverReason.unknown
+    assert verdict.should_fallback is False
