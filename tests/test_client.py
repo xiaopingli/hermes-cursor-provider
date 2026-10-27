@@ -1358,6 +1358,61 @@ def test_nudge_is_attempted_only_once():
     assert exc_info.value.error_code == "cursor_plan_only"
 
 
+def _prior_tool_messages():
+    return [
+        {"role": "user", "content": "review the post"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "command finished"},
+    ]
+
+
+def test_follow_up_announcement_does_not_abort_after_a_tool_ran():
+    """A later announcement must not fail the turn once a tool has already run."""
+    client, sdk = _sdk_client()
+    agent = _sequenced(sdk, ["I'll check the jobs.", "I'll check the jobs now."])
+    response = client.chat.completions.create(
+        model="grok-4.7",
+        messages=_prior_tool_messages(),
+        tools=[_tool()],
+    )
+    choice = response.choices[0]
+    assert choice.finish_reason == "stop"
+    assert not choice.message.tool_calls
+    text = choice.message.content or ""
+    assert "already ran" in text
+    assert "I'll check" not in text
+    assert len(agent.messages) == 2
+
+
+def test_follow_up_announcement_stream_emits_the_stop_not_the_plan():
+    client = CursorSDKClient(api_key="crsr_test")
+    sdk = client._sdk_client()
+    sdk.result.result = ""
+    _stream_agent(
+        sdk,
+        [[_assistant_event("I'll check the jobs.")], [_assistant_event("I'll check the jobs now.")]],
+    )
+    chunks = list(_streamed(client, messages=_prior_tool_messages()))
+    client.close()
+    text = _stream_text(chunks)
+    assert "already ran" in text
+    assert "I'll check" not in text
+    reasons = [
+        chunk.choices[0].finish_reason
+        for chunk in chunks
+        if chunk.choices and chunk.choices[0].finish_reason
+    ]
+    assert reasons == ["stop"]
+
+
 @pytest.mark.parametrize("final", ["alpha-beta", "All 4 groups are committed and pushed.", "Done: 391"])
 def test_real_final_answers_are_not_nudged(final):
     client, sdk = _sdk_client()
