@@ -714,6 +714,27 @@ _PLEASANTRY_RE = re.compile(
 _FINAL_RE = re.compile(r"\A\s*FINAL:", re.IGNORECASE)
 
 
+def _prior_tool_ran(messages: list[Any] | None) -> bool:
+    """True when this Hermes turn already executed a tool before this provider call."""
+    for raw in messages or []:
+        message = _plain(raw)
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") == "tool":
+            return True
+        if message.get("tool_calls"):
+            return True
+    return False
+
+
+# Delivered instead of cursor_plan_only when a tool has already run. Must not
+# repeat the announcement: that text is not the answer.
+_STOP_AFTER_TOOL = (
+    "Stopped. A tool already ran in this turn. The next reply announced more work "
+    "and did not call a tool, so that step was not run."
+)
+
+
 def _plan_nudge_enabled() -> bool:
     return os.environ.get("HERMES_CURSOR_PLAN_NUDGE", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -1365,6 +1386,7 @@ class CursorSDKClient:
         allowed_names: set[str],
         control: _StreamControl | None = None,
         mode: str = "ephemeral",
+        prior_tool: bool = False,
     ) -> Any:
         """Run one turn; if it ends on a plan with tools available, nudge once for the call.
 
@@ -1402,9 +1424,16 @@ class CursorSDKClient:
                 part for part in (content, _strip_final_marker(more)) if part
             ), peak
         if not _FINAL_RE.match(str(more or "")):
-            # Two strikes: the nudge was answered with another announcement. Raise HERE,
-            # before this turn is stored and before the streaming builder emits anything,
-            # so Hermes cannot report the turn as completed or swap in another provider.
+            # A first announcement, with no tool yet, still fails closed. A later
+            # announcement must not abort the turn: the tool result is already in
+            # Hermes history, and a 400 here discards it and can look like the
+            # whole request failed. Return a stop, not the announcement.
+            if prior_tool:
+                logger.info(
+                    "cursor: stopping a follow-up announcement; a tool already ran (raw: %.300r)",
+                    more,
+                )
+                return result, [], _STOP_AFTER_TOOL, peak
             raise CursorSDKRunError(
                 "Cursor announced work twice without a tool call or a FINAL: answer"
                 + (f": {more[:300]!r}" if more else ""),
@@ -1727,6 +1756,7 @@ class CursorSDKClient:
         timeout: float,
         allowed_names: set[str],
         control: _StreamControl | None = None,
+        prior_tool: bool = False,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
         sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1746,6 +1776,7 @@ class CursorSDKClient:
                         images=images,
                         allowed_names=allowed_names,
                         control=control,
+                        prior_tool=prior_tool,
                     )
                 )
             finally:
@@ -1773,6 +1804,7 @@ class CursorSDKClient:
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
+        prior_tool = _prior_tool_ran(messages)
 
         if not session_scope:
             prompt, allowed_names = render_prompt(
@@ -1787,6 +1819,7 @@ class CursorSDKClient:
                     timeout=timeout,
                     allowed_names=allowed_names,
                     control=control,
+                    prior_tool=prior_tool,
                 )
             )
 
@@ -1807,6 +1840,7 @@ class CursorSDKClient:
                     timeout=timeout,
                     allowed_names=allowed_names,
                     control=control,
+                    prior_tool=prior_tool,
                 )
             )
 
@@ -1864,6 +1898,7 @@ class CursorSDKClient:
                 allowed_names=allowed_names,
                 control=control,
                 mode="persistent",
+                prior_tool=prior_tool,
             )
             session.history = incoming + [_assistant_history(content, calls)]
             # Record the peak turn (or the billed prompt when no per-turn event arrived), so
@@ -2013,7 +2048,7 @@ class CursorSDKClient:
                 try:
                     kind, value = next(execution)
                 except StopIteration as stop:
-                    result, calls, _, context_usage = stop.value
+                    result, calls, returned, context_usage = stop.value
                     break
                 if kind == "reply":
                     # The announcement is not the answer: drop its held text. (The sync
@@ -2048,12 +2083,15 @@ class CursorSDKClient:
             )
             if native and not calls and nudged:
                 # The nudged reply: deliver it only when it begins with FINAL:, and strip
-                # the marker (same rule as the _run_agent check). Without the marker
-                # _run_agent has already raised, so there is nothing to flush.
+                # the marker (same rule as the _run_agent check). A follow-up announcement
+                # after a tool already ran returns a stop sentence instead of raising;
+                # emit that sentence, never the held announcement.
                 buffered = "".join(hold)
                 hold.clear()
                 if _FINAL_RE.match(buffered):
                     yield from emit_text(_strip_final_marker(buffered))
+                elif returned:
+                    yield from emit_text(returned)
             elif nudged:
                 # A call means this reply continues the turn, but a FINAL: prefix it
                 # emitted anyway must not reach the delivered text (same rule as the
