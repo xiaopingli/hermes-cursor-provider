@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Opt-in native Hermes tools behind `HERMES_CURSOR_NATIVE_TOOLS` (default off). On the stream path, offered Hermes tools are registered as inert Cursor custom tools in the `mcp` capability group; no MCP servers are loaded, and Hermes still decides and runs every tool. A call cap (`HERMES_CURSOR_NATIVE_MAX_CALLS`, default 64) and stream keep-alives bound the run. Non-stream requests stay on the upstream text protocol. Unset the switch to turn it off.
+- Per-request `native_tools=on|off` in the model-name suffix overrides `HERMES_CURSOR_NATIVE_TOOLS` both ways and is not sent to Cursor. Under a multiplexing gateway, set the env form and `HERMES_CURSOR_MODEL_VARIANTS` in the launch `.env`; a named profile's `.env` does not reach the plugin.
 
 ## 0.4.1
 

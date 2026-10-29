@@ -13,13 +13,26 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Disables Cursor built-in tools and MCP servers, gives each SDK agent a private working directory, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools stay off unless `HERMES_CURSOR_NATIVE_TOOLS` is set; see [Native tools (opt-in)](#native-tools-opt-in).
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools stay off unless `HERMES_CURSOR_NATIVE_TOOLS` is set or the model name says `native_tools=on`; see [Native tools (opt-in)](#native-tools-opt-in).
 
 ## Native tools (opt-in)
 
-Set `HERMES_CURSOR_NATIVE_TOOLS=1` to offer Hermes's tool list as Cursor custom tools on the stream path. They ride the SDK `mcp` capability group (`tools: ["mcp"]`). No MCP servers are loaded: `mcp_servers` stays empty and `setting_sources` is not set, so the only tools are the ones Hermes offered. The executor is inert. Hermes still decides and runs every tool after the turn; the model must not invent a result.
+Offer Hermes's tool list as Cursor custom tools on the stream path in either of two ways. The model name wins over the environment in both directions.
 
-`HERMES_CURSOR_NATIVE_MAX_CALLS` caps accepted calls in one run (default 64, clamped 1–1024). A non-stream request (streaming off, or Hermes's one-off 5xx retry) stays on the upstream text protocol. The first such request in a native session re-sends the full transcript, and the next stream request re-sends it again. Unset the variable to turn native tools off. In a measured comparison the native arm took about twice the wall time and more tool rounds than the text protocol.
+- Model parameter: append `native_tools=on` or `native_tools=off` to the `id@key=value,…` suffix, for example `grok-4.7@context=500k,reasoning_effort=xhigh,fast=true,native_tools=on` or `grok-4.7@native_tools=on`. `native_tools` is plugin-only and is not sent to Cursor. A model whose only parameter is `native_tools` selects the bare id. Any other value is an error. Switching it with `/model` starts a different retained session.
+- Environment: `HERMES_CURSOR_NATIVE_TOOLS=1` turns it on when the model name does not say. `=0` or unset leaves it off unless the name says `native_tools=on`.
+
+They ride the SDK `mcp` capability group (`tools: ["mcp"]`). No MCP servers are loaded: `mcp_servers` stays empty and `setting_sources` is not set, so the only tools are the ones Hermes offered. The executor is inert. Hermes still decides and runs every tool after the turn; the model must not invent a result.
+
+`HERMES_CURSOR_NATIVE_MAX_CALLS` caps accepted calls in one run (default 64, clamped 1–1024). A non-stream request (streaming off, or Hermes's one-off 5xx retry) stays on the upstream text protocol even when the name says `native_tools=on`. The first such request in a native session re-sends the full transcript, and the next stream request re-sends it again. In a measured comparison the native arm took about twice the wall time and more tool rounds than the text protocol.
+
+This host runs one gateway that serves every profile (`gateway.multiplex_profiles`, default on). Under that gateway:
+
+1. A named profile's own `.env` does not reach the plugin, so use the model parameter there.
+2. The env form in the launch (default) `.env` turns native mode on for every profile that gateway serves.
+3. To pick a `…,native_tools=on` name with `/model`, list it in the launch `.env`'s `HERMES_CURSOR_MODEL_VARIANTS`. CLI `--model` and a config model string are not catalog-checked.
+
+Rollback: remove `native_tools=on|off` from every model name (and from `HERMES_CURSOR_MODEL_VARIANTS`) first. Unsetting `HERMES_CURSOR_NATIVE_TOOLS` only covers the env form.
 
 ## Install
 
@@ -57,7 +70,7 @@ Without a suffix, Cursor picks the model's default variant. Parameter ids and va
 
 Hermes' `/reasoning` and `delegation.reasoning_effort` settings are **not** mapped onto Cursor parameters automatically. Select the model's own parameter explicitly with the `@key=value` suffix (for example `grok-4.7@reasoning_effort=xhigh`).
 
-Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the profile's `.env`:
+Hermes' `/model` command only accepts names from the provider's model listing. To make chosen variants selectable there, list them in `HERMES_CURSOR_MODEL_VARIANTS` (`;`-separated) in the launch (default) profile's `.env`. Under a multiplexing gateway a named profile's own `.env` does not reach the plugin:
 
 ```bash
 HERMES_CURSOR_MODEL_VARIANTS=grok-4.7@context=500k,reasoning_effort=xhigh,fast=true

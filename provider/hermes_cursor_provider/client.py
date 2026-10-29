@@ -1058,6 +1058,24 @@ def _split_model(model: str | None) -> tuple[str, list[dict[str, str]]]:
     return base, params
 
 
+def _plugin_params(model: str | None) -> tuple[list[dict[str, str]], bool | None]:
+    """Cursor params plus the plugin-only ``native_tools`` override.
+
+    ``on`` / ``off`` become True / False. Any other value is an error. The
+    parameter is not a Cursor parameter and must not be sent to the SDK.
+    """
+    _, params = _split_model(model)
+    cursor = [param for param in params if param["id"] != "native_tools"]
+    chosen = next((param["value"] for param in params if param["id"] == "native_tools"), None)
+    if chosen is None:
+        return cursor, None
+    if chosen not in {"on", "off"}:
+        raise ValueError(
+            f"Cursor model parameter 'native_tools' must be on or off; got {chosen!r}"
+        )
+    return cursor, chosen == "on"
+
+
 def _model_id(model: str | None) -> str:
     """Normalised model name, including any parameters (used as a session key)."""
     base, params = _split_model(model)
@@ -1069,8 +1087,9 @@ def _model_id(model: str | None) -> str:
 
 
 def _model_selection(model: str | None) -> str | dict[str, Any]:
-    """Value for the SDK's ``model`` option: a bare id or ``{id, params}``."""
-    base, params = _split_model(model)
+    """SDK ``model`` option. ``native_tools`` is stripped and never sent."""
+    base, _ = _split_model(model)
+    params, _ = _plugin_params(model)
     return {"id": base, "params": params} if params else base
 
 
@@ -2030,7 +2049,7 @@ class CursorSDKClient:
         Returns (result, calls, content). Non-stream callers drain it; stream callers
         convert the events into OpenAI chunks before the SDK run completes."""
         self._validate_request()
-        _split_model(model)  # reject malformed model parameters before launching the bridge
+        _, override = _plugin_params(model)  # reject a bad native_tools value before the bridge
         home = _home_key()
         bridge = _bridge_for(home)
         incoming = _conversation(messages)
@@ -2040,7 +2059,8 @@ class CursorSDKClient:
             and bool(choice["function"].get("name"))
         )
         specs = tool_specs(tools, tool_choice)
-        native_on = _flag("HERMES_CURSOR_NATIVE_TOOLS", False) and bool(specs) and stream
+        switch = override if override is not None else _flag("HERMES_CURSOR_NATIVE_TOOLS", False)
+        native_on = switch and bool(specs) and stream
         offered = specs if native_on else None
 
         if not session_scope:
@@ -2347,6 +2367,7 @@ def _configured_variants(models: list[str], catalog: Iterable[Any]) -> list[str]
             continue
         try:
             base, params = _split_model(entry)
+            stripped, _ = _plugin_params(entry)
         except ValueError:
             continue
         name = _model_id(entry)
@@ -2355,7 +2376,7 @@ def _configured_variants(models: list[str], catalog: Iterable[Any]) -> list[str]
             and base in known
             and name
             and name not in out
-            and _parameter_error(base, params, allowed) is None
+            and _parameter_error(base, stripped, allowed) is None
         ):
             out.append(name)
     return out
