@@ -17,7 +17,9 @@ from hermes_cursor_provider import client as client_module
 from hermes_cursor_provider.client import CursorSDKClient, CursorSDKRunError
 from test_client import (  # noqa: E402
     FakeAgent,
+    FakeCursorClient,
     _assistant_event,
+    _parameter,
     _stream_calls,
     _stream_text,
     fake_sdk,
@@ -177,14 +179,14 @@ def _client():
     return CursorSDKClient(api_key="crsr_test")
 
 
-def _go(client, messages, tools, *, stream=True, scope=None, tool_choice=None):
+def _go(client, messages, tools, *, stream=True, scope=None, tool_choice=None, model="auto"):
     kwargs = {}
     if scope:
         kwargs["_cursor_session_scope"] = scope
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
     created = client.chat.completions.create(
-        model="auto", messages=messages, tools=tools, stream=stream, **kwargs,
+        model=model, messages=messages, tools=tools, stream=stream, **kwargs,
     )
     return list(created) if stream else created
 
@@ -1285,5 +1287,174 @@ def test_22_named_tool_choice_recreates_with_that_tool_only(monkeypatch):
         )
         assert sdk.agents[0].closed
         assert set(sdk.options[-1]["local"]["custom_tools"]) == {"read_file"}
+    finally:
+        client.close()
+
+
+# --- 23 (R) N7 per-request native_tools ------------------------------------
+
+
+_FAST = {"id": "grok-4.7", "params": [{"id": "fast", "value": "true"}]}
+
+
+def _assert_name_on(options, prompt):
+    tools = options["local"]["custom_tools"]
+    assert set(tools) == {"read_file", "web_search"}
+    assert tools["read_file"]["input_schema"] == READ["function"]["parameters"]
+    assert options["tools"] == ["mcp"]
+    assert options["mcp_servers"] == {}
+    assert options["model"] == _FAST
+    assert "native_tools" not in json.dumps(options["model"])
+    assert "The only tools you have are the Hermes tools listed below." in prompt
+    assert "Call Hermes tools through your tool-calling channel" in prompt
+    assert "MCP servers are disabled" not in prompt
+    assert prompt != FIXTURE
+
+
+def test_23a_model_on_offers_tools_and_beats_env_off(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_NATIVE_TOOLS", raising=False)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=True,
+            model="grok-4.7@fast=true,native_tools=on",
+        )
+        _assert_name_on(sdk.options[0], sdk.messages[0]["text"])
+    finally:
+        client.close()
+
+    monkeypatch.setenv("HERMES_CURSOR_NATIVE_TOOLS", "0")
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=True,
+            model="grok-4.7@fast=true,native_tools=on", scope="23a-env-off",
+        )
+        _assert_name_on(sdk.options[0], sdk.messages[0]["text"])
+    finally:
+        client.close()
+
+
+def test_23b_model_off_beats_env_on(monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_NATIVE_TOOLS", "1")
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=True,
+            model="grok-4.7@native_tools=off",
+        )
+        _assert_upstream_options(sdk.options[0])
+        assert sdk.options[0].get("model") == "grok-4.7"
+        assert sdk.messages[0]["text"] == FIXTURE
+    finally:
+        client.close()
+
+
+def test_23c_bad_native_tools_fails_before_bridge_or_agent(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(client_module, "_bridge_for", boom)
+    monkeypatch.setattr(CursorSDKClient, "_create_agent", boom)
+    client = _client()
+    try:
+        with pytest.raises(ValueError, match=r"native_tools.*must be on or off"):
+            list(client.chat.completions.create(
+                model="grok-4.7@native_tools=maybe",
+                messages=FIXTURE_MESSAGES,
+                tools=FIXTURE_TOOLS,
+                stream=True,
+            ))
+    finally:
+        client.close()
+
+
+def test_23d_only_native_tools_is_bare_id_without_catalog(monkeypatch):
+    calls = []
+    original = FakeCursorClient.list_models
+
+    def wrapped(self, *, api_key):
+        calls.append(api_key)
+        return original(self, api_key=api_key)
+
+    monkeypatch.setattr(FakeCursorClient, "list_models", wrapped)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=True,
+            model="grok-4.7@native_tools=on",
+        )
+        assert sdk.options[0]["model"] == "grok-4.7"
+        assert calls == []
+    finally:
+        client.close()
+
+
+def test_23e_listing_keeps_native_tools_when_catalog_has_only_fast(monkeypatch):
+    monkeypatch.setenv(
+        "HERMES_CURSOR_MODEL_VARIANTS",
+        "grok-4.7@fast=true,native_tools=on;grok-4.7@native_tools=on",
+    )
+    monkeypatch.setattr(
+        FakeCursorClient,
+        "models",
+        [SimpleNamespace(
+            id="grok-4.7",
+            parameters=[_parameter("fast", "true", "false")],
+            variants=[],
+        )],
+    )
+    listed = client_module.list_cursor_models(api_key="crsr_test")
+    assert "grok-4.7@fast=true,native_tools=on" in listed
+    assert "grok-4.7@native_tools=on" in listed
+
+
+def test_23f_native_tools_stays_in_session_key_and_splits_agents():
+    assert client_module._model_id("grok-4.7@native_tools=on") != client_module._model_id(
+        "grok-4.7@native_tools=off"
+    )
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        sdk.result.stream_text = "hello"
+        sdk.result.result = "hello"
+        first = _go(
+            client, [{"role": "user", "content": "ping"}], None, stream=True,
+            scope="scope-23f", model="grok-4.7@native_tools=on",
+        )
+        assert _stream_text(first) == "hello"
+        _go(
+            client,
+            [
+                {"role": "user", "content": "ping"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "again"},
+            ],
+            None,
+            stream=True,
+            scope="scope-23f",
+            model="grok-4.7@native_tools=off",
+        )
+        assert len(sdk.agents) == 2
+    finally:
+        client.close()
+
+
+def test_23g_model_on_nonstream_stays_upstream(monkeypatch):
+    monkeypatch.delenv("HERMES_CURSOR_NATIVE_TOOLS", raising=False)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=False, scope="fresh-23g",
+            model="grok-4.7@native_tools=on",
+        )
+        _assert_upstream_options(sdk.options[0])
+        assert sdk.options[0].get("model") == "grok-4.7"
+        assert sdk.messages[0]["text"] == FIXTURE
     finally:
         client.close()
