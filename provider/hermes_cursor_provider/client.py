@@ -46,6 +46,11 @@ _SECRET_KEY_RE = re.compile(r"(pass|secret|token|key|auth|cookie|credential|^tex
 _DEBUG_RAW_FIELDS = {"args", "arguments", "result", "block"}
 # Cursor-native MCP wrapper tool names; their args carry the real tool name.
 _NATIVE_WRAPPERS = {"callmcptool", "call_mcp_tool", "mcp", "use_mcp_tool"}
+_NATIVE_INTERCEPT_FORCED_LOGGED = False
+_INERT_ACK = (
+    "Recorded for Hermes. Hermes decides whether to run it after this turn; "
+    "the result, if any, arrives in the next message. Do not repeat this call."
+)
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -432,12 +437,69 @@ def tool_specs(tools: list[Any] | None, tool_choice: Any = None) -> list[dict[st
     return specs
 
 
+def _inert_execute(_args: Any, _context: Any) -> str:
+    return _INERT_ACK
+
+
+def _native_max_calls() -> int:
+    raw = os.environ.get("HERMES_CURSOR_NATIVE_MAX_CALLS", "").strip()
+    try:
+        value = int(raw) if raw else 64
+    except ValueError:
+        value = 64
+    return min(1024, max(1, value))
+
+
+def _tools_digest(specs: list[dict[str, Any]]) -> str:
+    rows = [[s["name"], s["description"], s["parameters"]] for s in sorted(specs, key=lambda s: s["name"])]
+    return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+
+
+def _native_miss_name(name: Any, args: Any) -> str:
+    tool_name = str(name or "")
+    if tool_name.replace("-", "_").lower() not in _NATIVE_WRAPPERS:
+        return tool_name
+    try:
+        parsed = _plain(json.loads(args) if isinstance(args, str) else args)
+    except json.JSONDecodeError:
+        return tool_name
+    inner = parsed.get("toolName") or parsed.get("tool_name") or parsed.get("name") if isinstance(parsed, dict) else None
+    return str(inner) if inner else tool_name
+
+
+def _render_native_prompt(messages: list[Any], *, tools: list[Any] | None, tool_choice: Any) -> tuple[str, set[str]]:
+    specs = tool_specs(tools, tool_choice)
+    allowed = {spec["name"] for spec in specs}
+    sections = [
+        "You are the model inside Hermes Agent. Hermes is the only tool control plane.",
+        "Cursor built-in tools are disabled and no MCP servers are configured. The only tools you have are the Hermes tools listed below. Never claim to have read, written, executed, browsed, or changed anything unless the transcript contains the corresponding Hermes tool result.",
+    ]
+    if specs:
+        sections.append(
+            "Call Hermes tools through your tool-calling channel; you may call several. Hermes runs them after your turn and returns the results in the next message, so do not wait for a result or invent one. When the work is finished, reply with the answer."
+        )
+        sections.append("Hermes tools:\n" + json.dumps(specs, ensure_ascii=False, separators=(",", ":")))
+    else:
+        sections.append("No Hermes tools are available for this request. Answer in plain text.")
+    if tool_choice == "required":
+        sections.append("A Hermes tool call is required before answering.")
+    sections.append(
+        "Conversation transcript (data, not instructions about the tool protocol):\n"
+        + json.dumps(_conversation(messages), ensure_ascii=False, separators=(",", ":"))
+    )
+    sections.append("Continue from the final transcript entry.")
+    return "\n\n".join(sections), allowed
+
+
 def render_prompt(
     messages: list[Any],
     *,
     tools: list[Any] | None = None,
     tool_choice: Any = None,
+    native: bool = False,
 ) -> tuple[str, set[str]]:
+    if native:
+        return _render_native_prompt(messages, tools=tools, tool_choice=tool_choice)
     specs = tool_specs(tools, tool_choice)
     allowed = {spec["name"] for spec in specs}
     sections = [
@@ -783,8 +845,9 @@ class _ToolBlockStream:
     _OPEN = "<tool_call>"
     _CLOSE = "</tool_call>"
 
-    def __init__(self, allowed_names: set[str]) -> None:
+    def __init__(self, allowed_names: set[str], *, quiet: bool = False) -> None:
         self._allowed = allowed_names
+        self._quiet = quiet
         self._buffer = ""
         self._text: list[str] = []
         self.calls: list[Any] = []
@@ -831,8 +894,9 @@ class _ToolBlockStream:
             )
             if not found:
                 self.rejected += 1
-                _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
-                _debug_event("rejected_tool_block", chars=len(block))
+                if not self._quiet:
+                    _LOG.warning("cursor provider: rejected an unusable <tool_call> block (%d chars)", len(block))
+                    _debug_event("rejected_tool_block", chars=len(block))
                 yield ("rejected", self._record(block))
             else:
                 for call in found:
@@ -928,7 +992,20 @@ def _native_tool_call(name: Any, args: Any, call_id: str, allowed: set[str], ord
     return _tool_call_from_payload(json.dumps(payload), allowed, ordinal)
 
 
-def render_correction(allowed: set[str], misses: list[str], rejected: int) -> str:
+def render_correction(allowed: set[str], misses: list[str], rejected: int, *, native: bool = False) -> str:
+    if native:
+        parts = [
+            "Your last reply did not produce a valid Hermes tool call. "
+            "Call one of the offered tools through your tool-calling channel now."
+        ]
+        if misses:
+            parts.append(
+                "These native tool names do not exist in this runtime: " + ", ".join(sorted(set(misses))[:10]) + "."
+            )
+        if rejected:
+            parts.append("A <tool_call> block was malformed or named an unknown tool.")
+        parts.append("Allowed tool names: " + ", ".join(sorted(allowed)[:80]) + ".")
+        return " ".join(parts)
     parts = ["Your last reply did not produce a valid Hermes tool call."]
     if misses:
         parts.append(
@@ -1148,6 +1225,8 @@ class _Session:
     cwd: Path
     agent: Any = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    tools_digest: str = ""
+    retire_reason: str = "new"
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -1341,6 +1420,7 @@ class CursorSDKClient:
         self.chat = SimpleNamespace(completions=_Completions(self))
         self.is_closed = False
         self._runs: set[Any] = set()
+        self._cancelled_runs: set[Any] = set()
         self._runs_lock = threading.Lock()
 
     def __enter__(self):
@@ -1367,6 +1447,7 @@ class CursorSDKClient:
     def cancel(self) -> None:
         with self._runs_lock:
             runs = tuple(self._runs)
+            self._cancelled_runs.update(runs)
         for run in runs:
             _cancel_run(run)
 
@@ -1383,6 +1464,9 @@ class CursorSDKClient:
         cwd: Path,
         model: str | None,
         timeout: float,
+        specs: list[dict[str, Any]] | None = None,
+        scope: str = "ephemeral",
+        reason: str = "new",
     ) -> Any:
         setup_client = bridge.client().with_options(
             timeout=timeout,
@@ -1409,6 +1493,14 @@ class CursorSDKClient:
                 raise ValueError(error)
         if selected_model:
             options["model"] = selected_model
+        offered = list(specs or [])
+        _LOG.info("cursor: agent created native_tools=%s tools=%d scope=%s reason=%s", "on" if offered else "off", len(offered), scope, reason)
+        if offered:
+            options["local"]["custom_tools"] = {
+                spec["name"]: {"description": spec["description"], "input_schema": spec["parameters"], "execute": _inert_execute}
+                for spec in offered
+            }
+            options["tools"] = ["mcp"]
         return setup_client.create_agent(options)
 
     def _consume(
@@ -1421,20 +1513,74 @@ class CursorSDKClient:
         deadline: float,
         cap: float,
         started: float,
+        native_on: bool = False,
+        control: Any = None,
     ) -> Any:
         """Stream one SDK run into ``parser``; returns (result, streamed, failure, stopped, peak).
 
         ``result.usage`` is left as the SDK's billed total; ``peak`` is this run's largest
         per-turn usage, which becomes the separate context anchor (see ``_context_fields``).
         """
-        intercept = _flag("HERMES_CURSOR_INTERCEPT_NATIVE", True)
+        global _NATIVE_INTERCEPT_FORCED_LOGGED
+        if native_on and not _flag("HERMES_CURSOR_INTERCEPT_NATIVE", True) and not _NATIVE_INTERCEPT_FORCED_LOGGED:
+            _NATIVE_INTERCEPT_FORCED_LOGGED = True
+            _LOG.info("cursor: interception forced on")
+        intercept = True if native_on else _flag("HERMES_CURSOR_INTERCEPT_NATIVE", True)
         streamed = ""
         failure = ""
         stopped = False
         stopping = False
+        call_cap = _native_max_calls() if native_on else 0
+        capped = False
+        post: _ToolBlockStream | None = None
+        last_tick: float | None = None
         # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
         # run-wide sum, so it can never stand in for one prompt (see _context_fields).
         peak_usage: Any = None
+
+        def _calls_back(label: str | None = None, *, who: str | None = None):
+            usage = peak_usage or SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
+            n = len(native["intercepted"])
+            if who:
+                _LOG.info("cursor: run cancelled by %s after %d native calls", who, n)
+            elif label:
+                _LOG.warning("cursor: run ended %s after %d native calls; returning them", label, n)
+            return SimpleNamespace(result="", usage=usage, model=None, status="FINISHED"), streamed, "", True, peak_usage
+
+        def _at_cap() -> bool:
+            return bool(native_on and call_cap and len(parser.calls) >= call_cap)
+
+        def _keep(call: Any, source: str) -> bool:
+            nonlocal capped, last_tick
+            if _at_cap():
+                if not capped:
+                    capped = True
+                    _LOG.info("cursor: cap reached")
+                return False
+            if not parser._accept(call):
+                return False
+            native["intercepted"].append(call)
+            _LOG.info("cursor: tool_call source=%s name=%s", source, call.function.name)
+            last_tick = last_tick if last_tick is not None else time.monotonic()
+            if _at_cap() and not capped:
+                capped = True
+                _LOG.info("cursor: cap reached")
+            return True
+
+        def _absorb(chunk: str):
+            nonlocal post
+            if post is None:
+                post = _ToolBlockStream(allowed_names, quiet=True)
+            for kind, value in post.feed(chunk):
+                if kind == "call" and _keep(value, "text"):
+                    yield ("call", value)
+
+        def _requested(run_obj: Any) -> str | None:
+            if self.is_closed or (control is not None and control.closed):
+                return "hermes"
+            with self._runs_lock:
+                return "hermes" if run_obj in self._cancelled_runs else None
+
         stream = getattr(run, "stream", None)
         if callable(stream):
             iterator = iter(cast(Iterable[Any], stream()))
@@ -1449,23 +1595,44 @@ class CursorSDKClient:
                     )
                 except StopIteration:
                     break
+                except Exception as exc:
+                    if not (native_on and native["intercepted"]):
+                        raise
+                    _cancel_run(run)
+                    label = "timeout" if getattr(exc, "error_code", "") == "cursor_run_timeout" else "error"
+                    return _calls_back(label)
                 kind = str(getattr(event, "type", ""))
-                if stopping and kind != "tool_call":
+                if native_on and last_tick is not None and time.monotonic() - last_tick >= 30:
+                    last_tick = time.monotonic()
+                    yield ("tick", None)
+                if stopping and kind != "tool_call" and not native_on:
                     # The intercepted batch is complete; cancel before nested work or text runs.
                     break
                 if kind == "assistant":
-                    if native["intercepted"]:
+                    if native["intercepted"] and not native_on:
                         stopped = True  # model moved on after a native call; Hermes owns the loop
                         break
                     payload = getattr(event, "message", None)
                     for block in getattr(payload, "content", ()) or ():
                         text = str(getattr(block, "text", "") or "")
-                        if text:
-                            streamed += text
+                        if not text:
+                            continue
+                        streamed += text
+                        if native_on and native["intercepted"]:
+                            yield from _absorb(text)
+                        else:
                             yield from parser.feed(text)
+                    if native_on and capped:
+                        _cancel_run(run)
+                        _LOG.info("cursor: run cancelled by plugin after %d native calls", len(native["intercepted"]))
+                        return _calls_back()
                 elif kind == "status":
                     status = str(getattr(event, "status", "") or "").upper()
                     if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                        if native_on and native["intercepted"]:
+                            _cancel_run(run)
+                            who = _requested(run) if status == "CANCELLED" else None
+                            return _calls_back(None if who else status.lower(), who=who)
                         failure = str(getattr(event, "message", "") or status)
                 elif kind == "usage":
                     # One event per turn that reported usage, carrying THAT turn's numbers
@@ -1482,6 +1649,8 @@ class CursorSDKClient:
                     status = str(getattr(event, "status", "") or "").lower()
                     args = getattr(event, "args", None)
                     call_id = str(getattr(event, "call_id", "") or "")
+                    if native_on:
+                        call_id = call_id.split("\n", 1)[0].strip()
                     _debug_event(
                         "tool_call", name=name, status=status, call_id=call_id,
                         arg_keys=sorted(str(key) for key in args) if isinstance(args, dict) else [],
@@ -1503,16 +1672,25 @@ class CursorSDKClient:
                     call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
                     if call is not None:
                         native["ids"].add(call_id or call.id)
-                        if parser._accept(call):
+                        if native_on:
+                            if _keep(call, "native"):
+                                yield ("call", call)
+                            if capped:
+                                _cancel_run(run)
+                                _LOG.info("cursor: run cancelled by plugin after %d native calls", len(native["intercepted"]))
+                                return _calls_back()
+                        elif parser._accept(call):
                             native["intercepted"].append(call)
                             stopping = True
                             _LOG.warning(
                                 "cursor provider: intercepted native tool call %r -> Hermes tool %r",
                                 name, call.function.name,
                             )
+                            _LOG.info("cursor: tool_call source=native name=%s", call.function.name)
                             yield ("call", call)
                     elif allowed_names and name:
-                        native["misses"].append(str(name))
+                        miss = _native_miss_name(name, args) if native_on else str(name)
+                        native["misses"].append(miss)
                         _LOG.warning("cursor provider: model called unknown native tool %r", name)
         else:
             iter_text = getattr(run, "iter_text", None)
@@ -1533,18 +1711,51 @@ class CursorSDKClient:
                     if text:
                         streamed += text
                         yield from parser.feed(text)
-        if intercept:
+        if intercept and not capped:
             for call_id, (name, args) in list(native["pending"].items()):
                 if call_id in native["ids"]:
                     continue
+                if native_on:
+                    call_id = str(call_id).split("\n", 1)[0].strip()
                 call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
-                if call is not None:
-                    native["ids"].add(call_id)
-                    if parser._accept(call):
-                        native["intercepted"].append(call)
-                        _LOG.warning("cursor provider: intercepted unfinished native tool call %r at run end", name)
+                if call is None:
+                    continue
+                native["ids"].add(call_id or call.id)
+                if native_on:
+                    if _keep(call, "native"):
                         yield ("call", call)
+                elif parser._accept(call):
+                    native["intercepted"].append(call)
+                    _LOG.warning("cursor provider: intercepted unfinished native tool call %r at run end", name)
+                    _LOG.info("cursor: tool_call source=native name=%s", call.function.name)
+                    yield ("call", call)
             native["pending"].clear()
+        if native_on and native["intercepted"]:
+            try:
+                result = _bounded_call(
+                    run.wait, deadline=deadline, cap=cap, started=started,
+                    phase="waiting for the run result", grace=_WAIT_COMPLETION_GRACE_SECONDS,
+                )
+            except Exception as exc:
+                _cancel_run(run)
+                label = "timeout" if getattr(exc, "error_code", "") == "cursor_run_timeout" else "error"
+                return _calls_back(label)
+            status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
+            status = str(status_value or "").upper()
+            if status in {"ERROR", "CANCELLED", "EXPIRED"}:
+                who = _requested(run) if status == "CANCELLED" else None
+                if who:
+                    _LOG.info("cursor: run cancelled by %s after %d native calls", who, len(native["intercepted"]))
+                else:
+                    _LOG.warning("cursor: run ended %s after %d native calls; returning them", status.lower(), len(native["intercepted"]))
+            tail = _unsent_tail(streamed, str(getattr(result, "result", "") or ""))
+            if tail:
+                yield from _absorb(tail)
+            if post is not None:
+                for kind, value in post.flush():
+                    if kind == "call" and _keep(value, "text"):
+                        yield ("call", value)
+            return result, streamed, "", True, peak_usage
         if stopping:
             # A terminal native call was accepted; the run is cancelled rather than waited on.
             stopped = True
@@ -1572,6 +1783,7 @@ class CursorSDKClient:
         require_call: bool = False,
         control: _StreamControl | None = None,
         info: dict[str, Any] | None = None,
+        native_on: bool = False,
     ) -> Any:
         """Run one logical turn with bounded, shared corrective recovery.
 
@@ -1592,7 +1804,7 @@ class CursorSDKClient:
             attempt_info: dict[str, Any] = {}
             execution = self._run_agent_once(
                 agent, prompt=prompt, images=images, allowed_names=allowed_names,
-                control=control, info=attempt_info,
+                control=control, info=attempt_info, native_on=native_on,
             )
             held: list[tuple[str, Any]] = []
             dropped: list[str] = []
@@ -1605,6 +1817,9 @@ class CursorSDKClient:
                         result, calls, content, context_usage = stop.value
                         attempts.append((result, context_usage))
                         break
+                    if event[0] == "tick":
+                        yield event
+                        continue
                     if holding:
                         held.append(event)
                         if event[0] == "call":
@@ -1665,7 +1880,7 @@ class CursorSDKClient:
             # One prompt covers both intents: name the native misses/rejections, list every
             # offered tool, and forbid another announcement or completion claim.
             prompt = render_correction(
-                allowed_names, attempt_misses, attempt_info.get("rejected", 0)
+                allowed_names, attempt_misses, attempt_info.get("rejected", 0), native=native_on,
             ) + " No tool was executed. Do not repeat an action announcement or claim completion. Hermes alone executes tools."
             _LOG.warning(
                 "cursor provider: no valid tool call (native misses=%d, rejected blocks=%d); "
@@ -1684,6 +1899,7 @@ class CursorSDKClient:
         allowed_names: set[str],
         control: _StreamControl | None = None,
         info: dict[str, Any] | None = None,
+        native_on: bool = False,
     ) -> Any:
         """Run exactly one SDK turn, yielding ('text'|'call', value) events as they stream.
 
@@ -1729,10 +1945,13 @@ class CursorSDKClient:
                     deadline=deadline,
                     cap=cap,
                     started=started,
+                    native_on=native_on,
+                    control=control,
                 )
             finally:
                 with self._runs_lock:
                     self._runs.discard(run)
+                    self._cancelled_runs.discard(run)
             if not stopped:
                 status_value = getattr(getattr(result, "status", ""), "value", getattr(result, "status", ""))
                 status = str(status_value or "").upper()
@@ -1756,6 +1975,7 @@ class CursorSDKClient:
             if run is not None:
                 with self._runs_lock:
                     self._runs.discard(run)
+                    self._cancelled_runs.discard(run)
 
     def _run_ephemeral(
         self,
@@ -1768,12 +1988,15 @@ class CursorSDKClient:
         allowed_names: set[str],
         require_call: bool = False,
         control: _StreamControl | None = None,
+        native_on: bool = False,
+        specs: list[dict[str, Any]] | None = None,
     ) -> Any:
         sessions_root = Path(bridge.workspace.name) / "sessions"
         sessions_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         with tempfile.TemporaryDirectory(prefix="ephemeral-", dir=str(sessions_root)) as cwd:
             agent = self._create_agent(
-                bridge=bridge, cwd=Path(cwd), model=model, timeout=timeout
+                bridge=bridge, cwd=Path(cwd), model=model, timeout=timeout,
+                specs=specs, scope="ephemeral", reason="new",
             )
             try:
                 return (
@@ -1784,6 +2007,7 @@ class CursorSDKClient:
                         allowed_names=allowed_names,
                         require_call=require_call,
                         control=control,
+                        native_on=native_on,
                     )
                 )
             finally:
@@ -1799,6 +2023,7 @@ class CursorSDKClient:
         timeout: float,
         session_scope: str,
         control: _StreamControl | None = None,
+        stream: bool = False,
     ) -> Any:
         """Run one logical turn, yielding ('text'|'call', value) as the SDK streams.
 
@@ -1814,10 +2039,13 @@ class CursorSDKClient:
             isinstance(choice, dict) and isinstance(choice.get("function"), dict)
             and bool(choice["function"].get("name"))
         )
+        specs = tool_specs(tools, tool_choice)
+        native_on = _flag("HERMES_CURSOR_NATIVE_TOOLS", False) and bool(specs) and stream
+        offered = specs if native_on else None
 
         if not session_scope:
             prompt, allowed_names = render_prompt(
-                messages, tools=tools, tool_choice=tool_choice
+                messages, tools=tools, tool_choice=tool_choice, native=native_on,
             )
             return (
                 yield from self._run_ephemeral(
@@ -1829,6 +2057,8 @@ class CursorSDKClient:
                     allowed_names=allowed_names,
                     require_call=require_call,
                     control=control,
+                    native_on=native_on,
+                    specs=offered,
                 )
             )
 
@@ -1838,7 +2068,7 @@ class CursorSDKClient:
         if session is None:
             # ponytail: concurrent turns bypass shared state instead of queueing or corrupting it.
             prompt, allowed_names = render_prompt(
-                messages, tools=tools, tool_choice=tool_choice
+                messages, tools=tools, tool_choice=tool_choice, native=native_on,
             )
             return (
                 yield from self._run_ephemeral(
@@ -1850,10 +2080,18 @@ class CursorSDKClient:
                     allowed_names=allowed_names,
                     require_call=require_call,
                     control=control,
+                    native_on=native_on,
+                    specs=offered,
                 )
             )
 
         try:
+            want = _tools_digest(specs) if native_on else ""
+            if session.agent is not None and session.tools_digest != want:
+                session.retire_reason = "toolset" if session.tools_digest and want else "mode"
+                _close_agent(session.agent)
+                session.agent = None
+                session.history.clear()
             extends = (
                 session.agent is not None
                 and len(incoming) == len(messages)
@@ -1861,6 +2099,7 @@ class CursorSDKClient:
                 and incoming[: len(session.history)] == session.history
             )
             if session.agent is not None and not extends:
+                session.retire_reason = "history"
                 _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
@@ -1868,14 +2107,20 @@ class CursorSDKClient:
             offset = len(session.history) if extends else 0
             request_messages = messages[offset:]
             if session.agent is None:
+                reason = session.retire_reason
                 session.agent = self._create_agent(
                     bridge=bridge,
                     cwd=session.cwd,
                     model=model,
                     timeout=timeout,
+                    specs=offered,
+                    scope="session",
+                    reason=reason,
                 )
+                session.tools_digest = want
+                session.retire_reason = "new"
             prompt, allowed_names = render_prompt(
-                request_messages, tools=tools, tool_choice=tool_choice
+                request_messages, tools=tools, tool_choice=tool_choice, native=native_on,
             )
             info: dict[str, Any] = {}
             result, calls, content = yield from self._run_agent(
@@ -1886,6 +2131,7 @@ class CursorSDKClient:
                 require_call=require_call,
                 control=control,
                 info=info,
+                native_on=native_on,
             )
             if (
                 not calls
@@ -1894,6 +2140,7 @@ class CursorSDKClient:
             ):
                 # The retained agent now remembers failed native-tool rounds; start clean next turn.
                 _LOG.warning("cursor provider: resetting retained SDK agent after a failed tool-call turn")
+                session.retire_reason = "poison"
                 _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
@@ -1905,6 +2152,7 @@ class CursorSDKClient:
                 _close_agent(session.agent)
             session.agent = None
             session.history.clear()
+            session.retire_reason = "new"
             raise
         finally:
             _release_session(session)
@@ -1935,6 +2183,7 @@ class CursorSDKClient:
         result, calls, content = _drain(self._execute(
             model=model, messages=messages or [], tools=tools, tool_choice=tool_choice,
             timeout=_timeout_seconds(timeout), session_scope=str(_cursor_session_scope or "").strip(),
+            stream=False,
         ))
         completion = SimpleNamespace(
             id=f"chatcmpl-cursor-{uuid.uuid4().hex}",
@@ -1979,6 +2228,7 @@ class CursorSDKClient:
             timeout=_timeout_seconds(timeout),
             session_scope=str(_cursor_session_scope or "").strip(),
             control=_cursor_stream_control,
+            stream=True,
         )
         stream_id = f"chatcmpl-cursor-{uuid.uuid4().hex}"
         response_model = str(model or "cursor")
@@ -2015,6 +2265,9 @@ class CursorSDKClient:
                 if kind == "call":
                     calls.append(value)
                     yield chunk(tool_calls=[_tool_delta(value, len(calls) - 1)])
+                    continue
+                if kind == "tick":
+                    yield chunk(content=None)
                     continue
                 if not value:
                     continue

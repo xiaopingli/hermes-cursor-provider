@@ -13,7 +13,13 @@ It uses Cursor's official [`cursor-sdk`](https://cursor.com/docs/sdk/python) pac
 - Disables Cursor built-in tools and MCP servers, gives each SDK agent a private working directory, and accepts only tool names offered by Hermes.
 - Returns OpenAI-shaped sync/async responses so Hermes retains its normal conversation, approval, and tool loop.
 
-Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools are not used because they would execute outside Hermes' approval path.
+Cursor's SDK is an agent surface, not a raw chat-completions API. The plugin retains one SDK agent per Hermes conversation/account/model, sends only newly appended messages, and translates explicit `<tool_call>` blocks back into Hermes tool calls. SDK custom tools stay off unless `HERMES_CURSOR_NATIVE_TOOLS` is set; see [Native tools (opt-in)](#native-tools-opt-in).
+
+## Native tools (opt-in)
+
+Set `HERMES_CURSOR_NATIVE_TOOLS=1` to offer Hermes's tool list as Cursor custom tools on the stream path. They ride the SDK `mcp` capability group (`tools: ["mcp"]`). No MCP servers are loaded: `mcp_servers` stays empty and `setting_sources` is not set, so the only tools are the ones Hermes offered. The executor is inert. Hermes still decides and runs every tool after the turn; the model must not invent a result.
+
+`HERMES_CURSOR_NATIVE_MAX_CALLS` caps accepted calls in one run (default 64, clamped 1–1024). A non-stream request (streaming off, or Hermes's one-off 5xx retry) stays on the upstream text protocol. The first such request in a native session re-sends the full transcript, and the next stream request re-sends it again. Unset the variable to turn native tools off. In a measured comparison the native arm took about twice the wall time and more tool rounds than the text protocol.
 
 ## Install
 

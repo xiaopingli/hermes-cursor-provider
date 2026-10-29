@@ -301,7 +301,7 @@ def test_04_inert_executor_returns_constant_and_writes_nothing(monkeypatch):
         for name in ("read_file", "web_search"):
             got = offered[name]["execute"]({"path": "x"}, CustomToolContext("c1"))
             assert got == INERT
-            assert "x" not in got
+            assert '"x"' not in got
         assert sorted(p.name for p in cwd.iterdir()) == before
     finally:
         client.close()
@@ -622,7 +622,11 @@ def test_13c_deadline_on_wait_after_a_call_returns_it(monkeypatch, caplog):
     client = _client()
     try:
         sdk = client._sdk_client()
-        script = [_call_a(), _jump(clock, _status("FINISHED"))]
+        def end_past_deadline(_run):
+            clock.advance(10_000)
+            return None
+
+        script = [_call_a(), _status("FINISHED"), end_past_deadline]
         runs = _install(sdk, [(script, _result(), True)])
         chunks = _go(client, [{"role": "user", "content": "go"}], [READ], stream=True)
         assert _names(chunks) == ["read_file"]

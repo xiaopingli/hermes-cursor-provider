@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Opt-in native Hermes tools behind `HERMES_CURSOR_NATIVE_TOOLS` (default off). On the stream path, offered Hermes tools are registered as inert Cursor custom tools in the `mcp` capability group; no MCP servers are loaded, and Hermes still decides and runs every tool. A call cap (`HERMES_CURSOR_NATIVE_MAX_CALLS`, default 64) and stream keep-alives bound the run. Non-stream requests stay on the upstream text protocol. Unset the switch to turn it off.
+
 ## 0.4.1
 
 - Keeps `usage.prompt_tokens`, `completion_tokens`, and the cache details as the SDK's **billed totals** (summed across every turn and every recovery attempt), and reports the run's **largest single turn** separately through `usage.initial_prompt_tokens` / `usage.initial_cached_tokens` — the hook Hermes reads as the size of the request it just sent. Replacing the whole usage object with the peak (as the previous revision did) dropped the other turns' output and cache spend from billing, and summing the anchor across recovery attempts reports 723k for three 240k/241k/242k-token prompts, failing a session that fits its window closed as "too large to compress further". The peak, not the last event: a run's turns are not ordered by size (one live thread measured 14,191 then 8,686 on consecutive calls). A run with no per-turn event keeps `result.usage` and reports no anchor. The context split requires Hermes >= 0.22.0; older hosts ignore the extra fields and anchor on the billed total.
