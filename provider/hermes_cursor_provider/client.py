@@ -1757,8 +1757,6 @@ class CursorSDKClient:
             for call_id, (name, args) in list(native["pending"].items()):
                 if call_id in native["ids"]:
                     continue
-                if native_on:
-                    call_id = str(call_id).split("\n", 1)[0].strip()
                 call = _native_tool_call(name, args, call_id, allowed_names, len(parser.calls) + 1)
                 if call is None:
                     continue
@@ -1794,9 +1792,8 @@ class CursorSDKClient:
             if tail:
                 yield from _absorb(tail)
             if post is not None:
-                for kind, value in post.flush():
-                    if kind == "call" and _keep(value, "text"):
-                        yield ("call", value)
+                # flush() yields only text or rejected, so it can produce no calls.
+                list(post.flush())
             return result, streamed, "", True, peak_usage
         if stopping:
             # A terminal native call was accepted; the run is cancelled rather than waited on.
