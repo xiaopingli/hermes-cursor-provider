@@ -546,6 +546,35 @@ def test_11_session_toolset_change_recreates_agent_and_resends(monkeypatch):
         client.close()
 
 
+def test_11b_description_only_change_recreates_with_toolset(monkeypatch, caplog):
+    _switch(monkeypatch, True)
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _install(sdk, [
+            _one_native("read_file", {"path": "a"}, "d1"),
+            _one_native("read_file", {"path": "b"}, "d2"),
+        ])
+        first = _go(
+            client, [{"role": "user", "content": "desc-request-1"}], [READ],
+            stream=True, scope="desc-only",
+        )
+        revised = _fn("read_file", "Read a different file", "path")
+        follow = _follow(
+            "desc-request-1", first,
+            {"role": "tool", "tool_call_id": _stream_calls(first)[0].id, "content": "file-a"},
+            {"role": "user", "content": "desc-request-2"},
+        )
+        _go(client, follow, [revised], stream=True, scope="desc-only")
+        assert len(sdk.agents) == 2
+        assert sdk.agents[0].closed
+        assert sdk.options[1]["local"]["custom_tools"]["read_file"]["description"] == "Read a different file"
+        assert "reason=toolset" in caplog.text
+    finally:
+        client.close()
+
+
 def test_12_session_to_no_tools_retires_agent_even_if_switch_drops(monkeypatch):
     _switch(monkeypatch, True)
     client = _client()
@@ -767,6 +796,71 @@ def test_13i_hermes_cancel_returns_calls_without_warning(monkeypatch, caplog):
         assert _names(closed) == ["read_file"]
         assert caplog.text.count("cancelled by hermes") >= 2
         assert "returning them" not in caplog.text
+    finally:
+        client.close()
+
+
+def test_13j_wait_hermes_cancel_is_info(monkeypatch, caplog):
+    _switch(monkeypatch, True)
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+
+        def wait(self):
+            self.wait_calls += 1
+            client.cancel()
+            return _result(status="CANCELLED")
+
+        monkeypatch.setattr(OfferRun, "wait", wait)
+        runs = _install(sdk, [([_call_a(), _status("FINISHED")], _result(), False)])
+        chunks = _go(client, [{"role": "user", "content": "wait-cancel"}], [READ], stream=True)
+        assert _names(chunks) == ["read_file"]
+        assert runs[0].wait_calls >= 1
+        assert "cancelled by hermes" in caplog.text
+        assert "returning them" not in caplog.text
+        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+    finally:
+        client.close()
+
+
+def test_13k_wait_runtime_error_is_error_not_timeout(monkeypatch, caplog):
+    _switch(monkeypatch, True)
+    caplog.set_level(logging.WARNING, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+
+        def wait(self):
+            self.wait_calls += 1
+            raise RuntimeError("sdk blew up")
+
+        monkeypatch.setattr(OfferRun, "wait", wait)
+        runs = _install(sdk, [([_call_a(), _status("FINISHED")], _result(), False)])
+        chunks = _go(client, [{"role": "user", "content": "wait-error"}], [READ], stream=True)
+        assert _names(chunks) == ["read_file"]
+        assert runs[0].wait_calls >= 1
+        assert "run ended error" in caplog.text
+        assert "run ended timeout" not in caplog.text
+    finally:
+        client.close()
+
+
+def test_13l_status_after_calls_cancels_run(monkeypatch):
+    _switch(monkeypatch, True)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        runs = _install(sdk, [
+            ([_call_a(), _status("ERROR", "boom")], _result(status="ERROR"), False),
+            ([_call_a(), _status("CANCELLED", "remote")], _result(status="CANCELLED"), False),
+        ])
+        error = _go(client, [{"role": "user", "content": "status-error"}], [READ], stream=True, scope="status-error")
+        cancelled = _go(client, [{"role": "user", "content": "status-cancel"}], [READ], stream=True, scope="status-cancel")
+        assert _names(error) == ["read_file"]
+        assert _names(cancelled) == ["read_file"]
+        assert runs[0].cancel_calls == 1
+        assert runs[1].cancel_calls == 1
     finally:
         client.close()
 
