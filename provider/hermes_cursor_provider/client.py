@@ -1556,9 +1556,11 @@ class CursorSDKClient:
         # The LARGEST per-turn ``usage`` event of this run. ``result.usage`` is the SDK's
         # run-wide sum, so it can never stand in for one prompt (see _context_fields).
         peak_usage: Any = None
+        turn_text, turn_calls, closed = "", 0, False
+        billed = SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
 
-        def _calls_back(label: str | None = None, *, who: str | None = None):
-            usage = peak_usage or SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
+        def _calls_back(label: str | None = None, *, who: str | None = None, usage: Any = None):
+            usage = usage or peak_usage or SimpleNamespace(input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0)
             n = len(native["intercepted"])
             if who:
                 _LOG.info("cursor: run cancelled by %s after %d native calls", who, n)
@@ -1636,6 +1638,16 @@ class CursorSDKClient:
                         text = str(getattr(block, "text", "") or "")
                         if not text:
                             continue
+                        if native_on and closed and text.strip():
+                            _cancel_run(run)
+                            n = len(native["intercepted"])
+                            _LOG.info("cursor: run ended on second answer after %d native calls", n)
+                            native["cut"] = True
+                            if n:
+                                return _calls_back(usage=billed)
+                            return SimpleNamespace(result=streamed, usage=billed, model=None, status="FINISHED"), streamed, "", True, peak_usage
+                        if native_on:
+                            turn_text += text
                         streamed += text
                         if native_on and native["intercepted"]:
                             yield from _absorb(text)
@@ -1663,7 +1675,18 @@ class CursorSDKClient:
                         peak_usage
                     ):
                         peak_usage = turn_usage
+                    if native_on:
+                        if turn_text.strip() and turn_calls == 0 and not native["pending"]:
+                            closed = True
+                        if turn_usage is not None:
+                            for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+                                setattr(billed, name, getattr(billed, name) + _token_count(turn_usage, name))
+                        turn_text = ""
+                        turn_calls = 0
                 elif kind == "tool_call":
+                    if native_on:
+                        closed = False
+                        turn_calls += 1
                     name = getattr(event, "name", "")
                     status = str(getattr(event, "status", "") or "").lower()
                     args = getattr(event, "args", None)
@@ -1863,6 +1886,7 @@ class CursorSDKClient:
             info["native_misses"] = info.get("native_misses", 0) + attempt_info.get("native_misses", 0)
             info["intercepted"] = info.get("intercepted", 0) + attempt_info.get("intercepted", 0)
             info["rejected"] = info.get("rejected", 0) + attempt_info.get("rejected", 0)
+            info["cut"] = info.get("cut") or attempt_info.get("cut")
             rejected = any(kind == "rejected" for kind, _ in held)
             held_text = "".join(value for kind, value in held if kind == "text")
             announced = bool(allowed_names) and _action_only(held_text or content)
@@ -1984,6 +2008,8 @@ class CursorSDKClient:
             info["misses"] = list(native["misses"])
             info["intercepted"] = len(native["intercepted"])
             info["rejected"] = parser.rejected
+            if native.get("cut"):
+                info["cut"] = True
             return result, parser.calls, parser.text, context_usage
         except BaseException:
             _cancel_run(run)
@@ -2161,6 +2187,12 @@ class CursorSDKClient:
                 # The retained agent now remembers failed native-tool rounds; start clean next turn.
                 _LOG.warning("cursor provider: resetting retained SDK agent after a failed tool-call turn")
                 session.retire_reason = "poison"
+                _close_agent(session.agent)
+                session.agent = None
+                session.history.clear()
+                return result, calls, content
+            if info.get("cut"):
+                session.retire_reason = "cut"
                 _close_agent(session.agent)
                 session.agent = None
                 session.history.clear()
