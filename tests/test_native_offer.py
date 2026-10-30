@@ -101,6 +101,7 @@ class OfferRun:
         self._result = result if result is not None else _result()
         self.block_wait = block_wait
         self.cancelled = False
+        self.cancel_calls = 0
         self.wait_calls = 0
 
     def stream(self):
@@ -122,6 +123,7 @@ class OfferRun:
 
     def cancel(self):
         self.cancelled = True
+        self.cancel_calls += 1
 
 
 def _native(name, args, *, status="completed", call_id="c1"):
@@ -1456,5 +1458,352 @@ def test_23g_model_on_nonstream_stays_upstream(monkeypatch):
         _assert_upstream_options(sdk.options[0])
         assert sdk.options[0].get("model") == "grok-4.7"
         assert sdk.messages[0]["text"] == FIXTURE
+    finally:
+        client.close()
+
+
+# --- 24a–24k (N8 second-answer cut) ----------------------------------------
+
+NATIVE_MODEL = "grok-4.7@native_tools=on"
+# da45a58, second 24c case (title, usage, assistant "\\n", then the call): the
+# stream layer holds the whitespace chunk and never emits it. Pinned literal.
+_24C_WHITESPACE_CONTENT = '{"title": "x"}'
+
+
+def _n8_lines(caplog):
+    return [line for line in caplog.text.splitlines() if "run ended on second answer" in line]
+
+
+def _created_reason(caplog, reason):
+    return [
+        line for line in caplog.text.splitlines()
+        if "agent created" in line and f"reason={reason}" in line
+    ]
+
+
+def test_24a_second_answer_is_cut(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Answer A"),
+            _usage_event(10),
+            _assistant_event("Answer B"),
+            _usage_event(12),
+            _status("FINISHED"),
+        ]
+        runs = _install(sdk, [(script, _result("Answer AAnswer B", input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24a-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert _stream_text(chunks) == "Answer A"
+        assert runs[0].cancel_calls == 1
+        assert runs[0].wait_calls == 0
+        assert chunks[-1].usage.prompt_tokens == 10
+        assert caplog.text.count("run ended on second answer after 0 native calls") == 1
+    finally:
+        client.close()
+
+
+def test_24b_call_turn_is_not_a_second_answer(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Checking."),
+            _native("read_file", {"path": "x"}, status="running", call_id="b1"),
+            _native("read_file", {"path": "x"}, status="completed", call_id="b1"),
+            _assistant_event("Done."),
+            _usage_event(10),
+            _status("FINISHED"),
+        ]
+        runs = _install(sdk, [(script, _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24b-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert _names(chunks) == ["read_file"]
+        assert runs[0].wait_calls == 1
+        assert runs[0].cancel_calls == 0
+        assert _n8_lines(caplog) == []
+    finally:
+        client.close()
+
+
+def _24c_script(whitespace):
+    script = [
+        _assistant_event('{"title": "x"}'),
+        _usage_event(5),
+    ]
+    if whitespace:
+        script.append(_assistant_event("\n"))
+    script.extend([
+        _native("read_file", {"path": "x"}, status="running", call_id="c24"),
+        _native("read_file", {"path": "x"}, status="completed", call_id="c24"),
+        _assistant_event("ok"),
+        _usage_event(7),
+        _status("FINISHED"),
+    ])
+    return script
+
+
+def _assert_24c_survives(chunks, run, caplog):
+    assert _names(chunks) == ["read_file"]
+    assert run.wait_calls == 1
+    assert run.cancel_calls == 0
+    assert _n8_lines(caplog) == []
+
+
+def test_24c_title_preamble_then_call_is_not_cut(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        runs = _install(sdk, [(_24c_script(False), _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24c-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        _assert_24c_survives(chunks, runs[0], caplog)
+    finally:
+        client.close()
+
+
+def test_24c_whitespace_chunk_does_not_cut(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        runs = _install(sdk, [(_24c_script(True), _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24c-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        _assert_24c_survives(chunks, runs[0], caplog)
+        assert _stream_text(chunks) == _24C_WHITESPACE_CONTENT
+    finally:
+        client.close()
+
+
+def test_24d_native_off_keeps_both_answers():
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Answer A"),
+            _usage_event(10),
+            _assistant_event("Answer B"),
+            _usage_event(12),
+            _status("FINISHED"),
+        ]
+        runs = _install(sdk, [(script, _result("Answer AAnswer B", input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24d-user"}], [READ],
+            stream=True, model="grok-4.7@native_tools=off",
+        )
+        assert _stream_text(chunks) == "Answer AAnswer B"
+        assert runs[0].wait_calls == 1
+        assert runs[0].cancel_calls == 0
+    finally:
+        client.close()
+
+
+def test_24e_pending_call_blocks_the_cut():
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Reading."),
+            _native("read_file", {"path": "x"}, status="running", call_id="pend"),
+            _usage_event(10),
+            _assistant_event("Aside."),
+            _usage_event(11),
+            _assistant_event("More."),
+            _native("read_file", {"path": "x"}, status="completed", call_id="pend"),
+            _status("FINISHED"),
+        ]
+        runs = _install(sdk, [(script, _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24e-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert runs[0].cancel_calls == 0
+        assert _names(chunks) == ["read_file"]
+    finally:
+        client.close()
+
+
+def test_24f_nonstream_stays_upstream(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        _go(
+            client, FIXTURE_MESSAGES, FIXTURE_TOOLS, stream=False, scope="n8-24f",
+            model=NATIVE_MODEL,
+        )
+        _assert_upstream_options(sdk.options[0])
+        assert sdk.messages[0]["text"] == FIXTURE
+        assert _n8_lines(caplog) == []
+    finally:
+        client.close()
+
+
+def test_24g_thinking_between_usages_does_not_cut(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Look."),
+            _native("read_file", {"path": "x"}, status="running", call_id="g1"),
+            _native("read_file", {"path": "x"}, status="completed", call_id="g1"),
+            _usage_event(10),
+            _thinking(),
+            _usage_event(5),
+            _assistant_event("Final."),
+            _status("FINISHED"),
+        ]
+        runs = _install(sdk, [(script, _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24g-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert runs[0].cancel_calls == 0
+        assert runs[0].wait_calls == 1
+        assert _n8_lines(caplog) == []
+        assert _names(chunks) == ["read_file"]
+    finally:
+        client.close()
+
+
+def test_24h_billed_is_the_sum_to_the_cut():
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _thinking(),
+            _usage_event(5),
+            _assistant_event("Answer"),
+            _usage_event(7),
+            _assistant_event("Again"),
+        ]
+        _install(sdk, [(script, _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24h-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert _stream_text(chunks) == "Answer"
+        assert chunks[-1].usage.prompt_tokens == 12
+    finally:
+        client.close()
+
+
+def test_24i_calls_path_cut_bills_the_sum_and_anchors_the_peak(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        script = [
+            _assistant_event("Look."),
+            _native("read_file", {"path": "x"}, status="running", call_id="i1"),
+            _native("read_file", {"path": "x"}, status="completed", call_id="i1"),
+            _usage_event(10),
+            _assistant_event("Text one."),
+            _usage_event(6),
+            _assistant_event("Text two."),
+        ]
+        runs = _install(sdk, [(script, _result(input_tokens=99), False)])
+        chunks = _go(
+            client, [{"role": "user", "content": "n8-24i-user"}], [READ],
+            stream=True, model=NATIVE_MODEL,
+        )
+        assert runs[0].cancel_calls == 1
+        assert _names(chunks) == ["read_file"]
+        assert chunks[-1].usage.prompt_tokens == 16
+        assert chunks[-1].usage.initial_prompt_tokens == 10
+        assert caplog.text.count("run ended on second answer after 1 native calls") == 1
+    finally:
+        client.close()
+
+
+def test_24j_no_call_cut_retires_agent_and_resends(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        user = "n8-24a-user-text"
+        follow = "n8-24j-new-user"
+        first_script = [
+            _assistant_event("Answer A"),
+            _usage_event(10),
+            _assistant_event("Answer B"),
+            _usage_event(12),
+            _status("FINISHED"),
+        ]
+        _install(sdk, [
+            (first_script, _result("Answer AAnswer B", input_tokens=99), False),
+            ([_assistant_event("Follow ok")], _result("Follow ok"), False),
+        ])
+        first = _go(
+            client, [{"role": "user", "content": user}], [READ],
+            stream=True, scope="n8-24j", model=NATIVE_MODEL,
+        )
+        second_messages = [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": _stream_text(first)},
+            {"role": "user", "content": follow},
+        ]
+        second = _go(
+            client, second_messages, [READ],
+            stream=True, scope="n8-24j", model=NATIVE_MODEL,
+        )
+        assert len(_created_reason(caplog, "cut")) == 1
+        sent = sdk.messages[-1]["text"]
+        assert user in sent
+        assert "Answer A" in sent
+        assert follow in sent
+        assert _stream_text(second) == "Follow ok"
+    finally:
+        client.close()
+
+
+def test_24k_calls_cut_retires_agent_and_resends(caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    client = _client()
+    try:
+        sdk = client._sdk_client()
+        user = "n8-24i-user-text"
+        script = [
+            _assistant_event("Look."),
+            _native("read_file", {"path": "x"}, status="running", call_id="k1"),
+            _native("read_file", {"path": "x"}, status="completed", call_id="k1"),
+            _usage_event(10),
+            _assistant_event("Text one."),
+            _usage_event(6),
+            _assistant_event("Text two."),
+        ]
+        _install(sdk, [
+            (script, _result(input_tokens=99), False),
+            ([_assistant_event("k-follow")], _result("k-follow"), False),
+        ])
+        first = _go(
+            client, [{"role": "user", "content": user}], [READ],
+            stream=True, scope="n8-24k", model=NATIVE_MODEL,
+        )
+        second_messages = _follow(
+            user, first,
+            {"role": "tool", "tool_call_id": _stream_calls(first)[0].id, "content": "file-k"},
+        )
+        second = _go(
+            client, second_messages, [READ],
+            stream=True, scope="n8-24k", model=NATIVE_MODEL,
+        )
+        assert len(_created_reason(caplog, "cut")) == 1
+        assert user in sdk.messages[-1]["text"]
+        assert _stream_text(second) == "k-follow"
     finally:
         client.close()
